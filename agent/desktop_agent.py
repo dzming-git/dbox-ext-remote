@@ -24,6 +24,19 @@ import threading
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# ---- DPI 感知：必须在创建任何窗口/DC 之前设置 ----
+# 本机若开了显示缩放（如 125%，物理 1920×1080 被虚化成 1536×864），未声明感知的
+# 进程里 GetSystemMetrics 返回虚化尺寸，但 SendInput 的绝对坐标始终按**物理屏**
+# 归一化。于是：抓屏只截到 1536 宽（显示不全）+ 鼠标点击按 1.25 倍偏移（固定偏差），
+# 两个症状同源。声明感知后两者都回到物理尺寸，偏差消失。
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 AGENT_PORT = 18921
 AGENT_HOST = '127.0.0.1'
 
@@ -201,6 +214,15 @@ class InputInjector(object):
         self.KEYBDINPUT = KEYBDINPUT
         self.INPUT = INPUT
         self._lock = threading.Lock()
+        # 系统/主屏 DPI（125% 缩放 = 120）。用它推出虚拟化尺寸：SendInput 的绝对坐标
+        # 归一化恒定按**虚拟化虚拟屏**（不受进程 DPI 感知影响），而 screen.width/height
+        # 已是 DPI 感知后的物理尺寸，两者差一个缩放比，必须换算，否则点击按 1/scale
+        # 成比例偏移（125% 下偏 0.8 倍）。
+        try:
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+        except Exception:
+            dpi = 96
+        self._scale = max(1.0, dpi / 96.0)
 
     def _send(self, items):
         arr = (self.INPUT * len(items))(*items)
@@ -231,11 +253,16 @@ class InputInjector(object):
         return i
 
     def _abs(self, x, y):
-        """像素坐标 → SendInput 的 0..65535 归一化绝对坐标（按整块虚拟屏）。"""
-        w = max(1, self.screen.width - 1)
-        h = max(1, self.screen.height - 1)
-        nx = int(max(0, min(65535, x * 65535 // w)))
-        ny = int(max(0, min(65535, y * 65535 // h)))
+        """像素坐标 → SendInput 的 0..65535 归一化绝对坐标（按整块虚拟屏）。
+
+        分母必须用**虚拟化尺寸**（物理 / 缩放比），因为 SendInput 的绝对坐标归一化
+        无视进程 DPI 感知，恒定映射到虚拟化虚拟屏。screen.width/height 是物理值，
+        直接除会按 1/scale 偏移。
+        """
+        vw = max(1, int(self.screen.width / self._scale) - 1)
+        vh = max(1, int(self.screen.height / self._scale) - 1)
+        nx = int(max(0, min(65535, x * 65535 // vw)))
+        ny = int(max(0, min(65535, y * 65535 // vh)))
         return nx, ny
 
     def mouse_move(self, x, y):
