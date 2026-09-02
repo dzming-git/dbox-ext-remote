@@ -63,7 +63,11 @@
     font-size: 11.5px; color: #6e7681; }
   .foot .warn { color: #d29922; }
   .foot .sp { flex: 1; }
-  #kb { position: absolute; opacity: 0; width: 1px; height: 1px; left: -9999px; top: 0; }
+  /* 软键盘输入框：必须**留在视口内**（不能 left:-9999px 移出屏幕），否则 iOS/Android
+     不会为屏外可编辑元素弹软键盘。opacity:0 + 1px 即可隐藏又不挡操作；font-size:16px
+     避免 iOS 聚焦时自动放大；caret-color:transparent 隐藏光标闪烁。 */
+  #kb { position: absolute; opacity: 0; width: 1px; height: 1px; left: 0; top: 0;
+    font-size: 16px; caret-color: transparent; }
 </style>
 </head>
 <body>
@@ -72,6 +76,7 @@
     <span class="state"><i class="dot" id="dot"></i><span id="state-txt">连接中…</span></span>
     <button id="btn-reconnect" title="断开后手动重连（也可等自动重连）">⟳ 重连</button>
     <button id="btn-restart-agent" title="重启桌面代理进程（应用输入/绘制等修复时用到；会短暂断一下）">⟲ 重启代理</button>
+    <button id="btn-kb" title="呼出/收起手机软键盘（点此后再点画面即可输入文字）">⌨ 键盘</button>
     <span class="sep"></span>
     <button data-fit="1" title="缩放至适应窗口">适应</button>
     <button data-fit="0" title="按屏幕原始像素 1:1 显示">100%</button>
@@ -416,7 +421,13 @@
     composing = false;
     if (e.data) send({ type: 'text', text: e.data });
     kb.value = '';
+    justComposed = true;   // 吞掉提交后紧随的那个 input（里面是同一段已上屏文本）
   });
+  // 普通字符走 input 事件上屏：手机软键盘在 keydown 里常给不到正确字符（key 多为
+  // "Unidentified"/keyCode 229），但每次落字都可靠触发 input；桌面端也走 input 更稳。
+  // 这里 keydown 只拦截「特殊键 / 组合键」直接发 key 事件；其余放行让字符落进 textarea，
+  // 再由 input 整段上屏后清空（顺带支持粘贴）。
+  var justComposed = false;
   kb.addEventListener('keydown', function (e) {
     if (composing) return;                    // 输入法组合中：交给 compositionend
     var k = (e.key || '').toLowerCase();
@@ -424,12 +435,22 @@
       e.preventDefault();
       send({ type: 'key', key: k, ctrl: e.ctrlKey, alt: e.altKey,
              shift: e.shiftKey, meta: e.metaKey });
-      return;
     }
-    if (e.key && e.key.length === 1) {
-      e.preventDefault();                     // 不落进 textarea，避免重复上屏
-      send({ type: 'text', text: e.key });
-    }
+  });
+  kb.addEventListener('input', function () {
+    if (composing) return;                     // 组合输入期间不抢，交给 compositionend
+    if (justComposed) { justComposed = false; return; }  // 吞掉 compositionend 后的尾随 input
+    if (kb.value) { send({ type: 'text', text: kb.value }); kb.value = ''; }
+  });
+  // 软键盘开关：手机端没有 click 可聚焦 #kb（canvas touchstart 抑制了合成 click），
+  // 所以需要一个按钮在用户手势里 focus 它来唤起软键盘；再点一次收起。
+  var kbOn = false;
+  $('btn-kb').addEventListener('click', function (e) {
+    e.stopPropagation();
+    kbOn = !kbOn;
+    this.classList.toggle('on', kbOn);
+    if (kbOn) kb.focus({ preventScroll: true });
+    else { kb.blur(); kb.value = ''; }
   });
 
   // ---- 触摸端交互（手机）----
