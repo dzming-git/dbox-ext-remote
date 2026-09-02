@@ -39,7 +39,7 @@
      顶部溢出到容器外，且滚动条够不到那一部分（flex 居中的经典陷阱），表现为
      「画面显示不全、上面一截看不到也滚不上去」。flex:0 0 auto 防止画布被压缩。 */
   .view { flex: 1; overflow: auto; background: #0e1116; position: relative;
-    display: flex; }
+    display: flex; touch-action: none; }
   .view.grabbing { cursor: grabbing; }
   #screen { display: block; background: #000; box-shadow: 0 0 0 1px #262d38;
     -webkit-user-drag: none; user-select: none; touch-action: none;
@@ -111,7 +111,7 @@
     <span id="f-meta">—</span>
     <span class="sp"></span>
     <span class="warn" id="f-warn"></span>
-    <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移</span>
+    <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移 · 触屏：单指拖＝拖动，长按＝右键，双指捏合＝缩放/平移</span>
   </div>
   <textarea id="kb" autocomplete="off" spellcheck="false"></textarea>
 </div>
@@ -426,29 +426,97 @@
     }
   });
 
-  // 触摸端：单指拖动＝移动，轻点＝左键，双指＝右键
-  var touch = null;
+  // ---- 触摸端交互（手机）----
+  // 单指：轻点＝左键单击；按住拖动＝按住左键拖动（选字/挪窗口）；长按＝右键。
+  // 双指：捏合＝缩放画面；双指平移＝滚动视图看放大后的其它区域。
+  // #screen / .view 已 touch-action:none，浏览器原生缩放手势被禁用，全部由这里接管。
+  var touch = null;        // 单指状态
+  var pinch = null;        // 双指状态
+  var lpTimer = null;      // 长按（右键）定时器
+  var suppressUp = false;  // 已发右键，touchend 不再补左键
+
+  function tdist(a, b) {
+    var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function tmid(a, b) { return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 }; }
+
   canvas.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    if (e.touches.length >= 2) {                 // 进入双指：先收掉单指未完成的动作
+      clearTimeout(lpTimer);
+      if (touch && touch.down && !suppressUp) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
+      touch = null; pinch = null; suppressUp = false;
+      var a = e.touches[0], b = e.touches[1];
+      pinch = { d0: tdist(a, b), z0: zoom, c0: tmid(a, b), sl: view.scrollLeft, st: view.scrollTop };
+      return;
+    }
     var t = e.touches[0];
     var p = toScreen(t.clientX, t.clientY);
     if (!p) return;
-    if (e.touches.length >= 2) { send({ type: 'mouse_click', x: p.x, y: p.y, button: 'right' }); return; }
-    touch = { t: Date.now(), p: p };
-    send({ type: 'mouse_move', x: p.x, y: p.y });
-    e.preventDefault();
+    touch = { sx: t.clientX, sy: t.clientY, p: p, last: p, t: Date.now(), moved: false, down: false };
+    suppressUp = false;
+    clearTimeout(lpTimer);
+    lpTimer = setTimeout(function () {           // 长按＝右键（不要先按左键）
+      if (touch && !touch.moved && !touch.down) {
+        send({ type: 'mouse_down', x: p.x, y: p.y, button: 'right' });
+        send({ type: 'mouse_up', x: p.x, y: p.y, button: 'right' });
+        suppressUp = true;
+      }
+    }, 480);
   }, { passive: false });
+
   canvas.addEventListener('touchmove', function (e) {
-    var t = e.touches[0];
-    var p = toScreen(t.clientX, t.clientY);
-    if (p) send({ type: 'mouse_move', x: p.x, y: p.y });
     e.preventDefault();
-  }, { passive: false });
-  canvas.addEventListener('touchend', function () {
-    if (touch && Date.now() - touch.t < 260) {
-      send({ type: 'mouse_click', x: touch.p.x, y: touch.p.y, button: 'left', clicks: 1 });
+    if (e.touches.length >= 2 && pinch) {        // 双指：缩放 + 平移
+      var a = e.touches[0], b = e.touches[1];
+      var ratio = tdist(a, b) / (pinch.d0 || 1);
+      setZoom(pinch.z0 * ratio, false);
+      var c = tmid(a, b);
+      view.scrollLeft = pinch.sl - (c.x - pinch.c0.x);
+      view.scrollTop = pinch.st - (c.y - pinch.c0.y);
+      return;
     }
-    touch = null;
-  });
+    if (touch && e.touches.length === 1) {
+      var t = e.touches[0];
+      var p = toScreen(t.clientX, t.clientY);
+      if (!p) return;
+      touch.last = p;
+      if (!touch.moved && (Math.abs(t.clientX - touch.sx) > 8 || Math.abs(t.clientY - touch.sy) > 8)) {
+        touch.moved = true;
+        clearTimeout(lpTimer);
+        if (!suppressUp && !touch.down) {        // 开始拖动＝按下左键
+          send({ type: 'mouse_down', x: touch.p.x, y: touch.p.y, button: 'left' });
+          touch.down = true;
+        }
+      }
+      if (touch.down) {
+        var now = Date.now();
+        if (now - lastMove >= MOVE_MS) {
+          lastMove = now;
+          send({ type: 'mouse_move', x: p.x, y: p.y });
+        }
+      }
+    }
+  }, { passive: false });
+
+  function endTouch(e) {
+    if (e) e.preventDefault();
+    clearTimeout(lpTimer);
+    if (touch) {
+      if (suppressUp) { /* 右键已处理，不再补左键 */ }
+      else if (touch.down) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
+      else if (!touch.moved) send({ type: 'mouse_click', x: touch.p.x, y: touch.p.y, button: 'left', clicks: 1 });
+      touch = null;
+    }
+    if (e && e.touches.length <= 1) pinch = null;   // 双指松开到单指：结束缩放
+  }
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', function () {
+    clearTimeout(lpTimer);
+    if (touch && touch.down && !suppressUp) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
+    touch = null; pinch = null; suppressUp = false;
+  }, { passive: false });
 
   // ---------------------------------------------------------------- 档位 / 细项
   function fillAdv() {
