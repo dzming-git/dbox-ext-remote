@@ -257,50 +257,34 @@ class InputInjector(object):
         return i
 
     def _abs(self, x, y):
-        """像素坐标 → SendInput 的 0..65535 归一化绝对坐标（按整块虚拟屏）。
+        """像素坐标 → SendInput 的 0..65535 归一化绝对坐标（按物理主屏尺寸）。
 
-        分母必须用**虚拟化尺寸**（物理 / 缩放比），因为 SendInput 的绝对坐标归一化
-        无视进程 DPI 感知，恒定映射到虚拟化虚拟屏。screen.width/height 是物理值，
-        直接除会按 1/scale 偏移。
+        **不加 MOUSEEVENTF_VIRTUALDESK**：本进程已 SetProcessDpiAwareness(2)，
+        无 VIRTUALDESK 时绝对坐标按「物理主屏」归一化，分母用物理宽高即精确、整屏可达；
+        加 VIRTUALDESK 反会被 Windows 锁死到「虚拟化虚拟屏」，125% 缩放下右/底约 0.8×
+        区域物理不可达、画出来整条偏移（这是此前点击偏 0.8 倍的根因）。
         """
-        # 配合 MOUSEEVENTF_VIRTUALDESK：绝对坐标映射到整个物理虚拟桌面，归一化
-        # 分母直接用 DPI 感知后的物理尺寸（screen.width/height），无需再除缩放比——
-        # 否则物理坐标 > 虚拟化宽（如 1920 屏下 1690 > 1536）会被 65535 上限钳到边界，
-        # 导致屏幕右下角整块点不到（表现为「越往右下偏越多」的非固定距离偏差）。
         vw = max(1, self.screen.width - 1)
         vh = max(1, self.screen.height - 1)
         nx = int(max(0, min(65535, x * 65535 // vw)))
         ny = int(max(0, min(65535, y * 65535 // vh)))
         return nx, ny
 
-    def _cursor_pos(self):
-        """当前光标位置（物理像素，与 SetCursorPos / 前端 screen 坐标同一坐标系）。"""
-        pt = self.POINT()
-        try:
-            if self._u.GetCursorPos(ctypes.byref(pt)):
-                return pt.x, pt.y
-        except Exception:
-            pass
-        return 0, 0
-
     def mouse_move(self, x, y):
-        # 必须先发「相对移动」再 SetCursorPos 精确归位，二者缺一不可：
-        # ① SetCursorPos 只移光标、不向目标窗口派发 WM_MOUSEMOVE——画图这类「在
-        #    mousemove 上连线」的程序只会拿到按下/抬起两个位置，画出来就是一条直线。
-        # ② 但若在 SetCursorPos 之后补发「绝对坐标的移动事件」，由于光标已停在目标点，
-        #    OS 认为没有位移，照样不派发 WM_MOUSEMOVE（此前这版正是死在这个坑里）。
-        # ③ 真正能稳定触发 WM_MOUSEMOVE 的是「相对位移」：从当前光标算 delta 注入，
-        #    光标确实发生了位移 → 必然派发消息 → 拖拽/手绘才能连续落点。相对位移作用在
-        #    物理光标坐标上，不受 DPI 虚拟化天花板限制，整块屏幕都可达（绝对移动在 125%
-        #    缩放下右侧/底部约 0.8× 区域物理上不可达，会画歪）。
-        # ④ 相对位移可能因系统「鼠标加速」产生微小漂移，最后用 SetCursorPos 精确归位，
-        #    既保证落点准确，又让下一帧的 delta 从正确位置算起、不累积误差。
-        cx, cy = self._cursor_pos()
-        dx = int(x) - cx
-        dy = int(y) - cy
-        if dx or dy:
-            self._send([self._mi(dx, dy, 0, MOUSEEVENTF_MOVE)])   # 相对移动，必发 WM_MOUSEMOVE
-        self._u.SetCursorPos(int(x), int(y))                       # 精确归位，消除加速漂移
+        # 关键：必须让光标通过「注入事件」真正移动到目标点，才能派发 WM_MOUSEMOVE。
+        # 画图（画图 / Photoshop 等）靠 WM_MOUSEMOVE 的实时位置连续落点；只 SetCursorPos
+        # 移动光标而不发事件 → 目标窗口收不到中间点，只会把按下点连到抬起点画成直线
+        # （纯文本拖选靠轮询光标位置所以看似正常，正是这个坑最隐蔽的地方）。
+        #
+        # 做法：先发「绝对坐标移动」事件（MOUSEEVENTF_ABSOLUTE，不加 VIRTUALDESK，
+        # DPI 感知下精确映射到物理主屏）→ 光标从旧位置真的移到目标点 → 必发 WM_MOUSEMOVE
+        # 且坐标正确；随后 SetCursorPos 同点精确归位（双保险，消除任何量化抖动）。
+        # 注意顺序：绝对移动必须在 SetCursorPos 之前，否则光标已停在目标点、OS 判定无位移
+        # 照样不派发 WM_MOUSEMOVE（be6e5bd 那版就是死在这个顺序上）。
+        nx, ny = self._abs(int(x), int(y))
+        self._send([self._mi(nx, ny, 0,
+                              MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)])   # 先注入移动，必发 WM_MOUSEMOVE
+        self._u.SetCursorPos(int(x), int(y))                              # 同点归位，双保险
 
     def _btn_flags(self, button, down):
         b = (button or 'left').lower()
