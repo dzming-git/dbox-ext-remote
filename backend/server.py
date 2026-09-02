@@ -40,6 +40,11 @@ PRESETS = {
 }
 PLACEHOLDER_CACHE = {}
 
+# 用户有输入后的「活跃窗口」：期间强制推帧、且让代理跳过静止检测，保证画图/拖拽实时可见。
+# 超过窗口无输入，再恢复静止跳过以省流量。
+ACTIVE_WINDOW = 2.0
+_last_input_ts = 0.0
+
 
 def _agent_url(path):
     return 'http://%s:%d%s' % (AGENT_HOST, AGENT_PORT, path)
@@ -162,11 +167,17 @@ def create_blueprint(host):
             miss = 0
             try:
                 while True:
+                    # 活跃窗口内：强制推帧，且让代理跳过静止检测（still_thr=0），
+                    # 这样画图/拖拽时即使只是细线变化也能实时刷新，不必切走再切回。
+                    active = (time.time() - _last_input_ts) < ACTIVE_WINDOW
                     data = None
                     fhash = 'offline'
                     try:
-                        q = ('/frame?scale=%.3f&q=%d&gray=%s'
-                             % (scale, quality, '1' if gray else '0'))
+                        parts = ['scale=%.3f' % scale, 'q=%d' % quality,
+                                 'gray=%s' % ('1' if gray else '0')]
+                        if active:
+                            parts.append('still_thr=0')
+                        q = '/frame?' + '&'.join(parts)
                         body, headers, _ = _agent_get(q, timeout=max(2.0, interval * 3))
                         data = body
                         fhash = headers.get('X-Frame-Hash') or 'f%d' % time.time()
@@ -178,7 +189,7 @@ def create_blueprint(host):
                             data = _placeholder_jpeg()
                             fhash = 'offline'
                     if data:
-                        if skip_still and fhash == last_hash:
+                        if skip_still and not active and fhash == last_hash:
                             time.sleep(interval)
                             continue
                         last_hash = fhash
@@ -220,6 +231,9 @@ def create_blueprint(host):
                 break
         if last_err and sent == 0:
             return jsonify({'success': False, 'message': '桌面代理未响应: %s' % last_err}), 502
+        # 记录最近一次输入时间，流生成器据此在「活跃窗口」内强制推帧（实时可见）。
+        global _last_input_ts
+        _last_input_ts = time.time()
         return jsonify({'success': True, 'sent': sent, 'error': last_err})
 
     @bp.route('/agent/install', methods=['POST'])
