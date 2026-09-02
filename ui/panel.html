@@ -121,6 +121,12 @@
   //（表现为「服务不可达」）。全屏页 /ext/remote 下同样适用——API 前缀与页面路径无关。
   var API = '/api/ext/remote';
   var $ = function (id) { return document.getElementById(id); };
+  // 服务端返回的错误信息可能含系统输出，一律转义后再塞进 innerHTML
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
 
   // ---- token：优先读宿主写进 localStorage 的最新 token ----
   var PUSHED = null;
@@ -425,14 +431,28 @@
   function hideOverlay() { ov.style.display = 'none'; }
 
   function agentGuide(err) {
+    // 安装失败必须把服务端原因显示出来：计划任务创建涉及账户与权限，
+    // 失败原因五花八门，静默重试只会让人反复点同一个按钮而毫无反馈
+    function doInstall() {
+      showOverlay('正在安装…', '正在创建计划任务并启动代理…', [], true);
+      api('/agent/install', { method: 'POST' })
+        .then(function (r) { return r.json().catch(function () { return {}; }); })
+        .then(function (d) {
+          if (d && d.success) {
+            showOverlay('已安装', '正在等待代理就绪…', [], true);
+            setTimeout(poll, 1500);
+            return;
+          }
+          showOverlay('安装失败', esc((d && d.message) || '未知错误'),
+                      [{ text: '重试', onClick: doInstall }], false);
+        }).catch(function (e) {
+          showOverlay('安装失败', '请求失败：' + esc(String(e)),
+                      [{ text: '重试', onClick: doInstall }], false);
+        });
+    }
     var btns = [{
       text: autostart ? '立即启动代理' : '安装开机自启并启动',
-      onClick: function () {
-        showOverlay('正在启动…', '', [], true);
-        api('/agent/install', { method: 'POST' }).then(function () {
-          setTimeout(poll, 1200);
-        }).catch(function () { setTimeout(poll, 1200); });
-      },
+      onClick: doInstall,
     }];
     showOverlay('桌面代理未运行',
       '画面采集与鼠标键盘注入必须由运行在<b>登录会话</b>里的代理进程完成——'
