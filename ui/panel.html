@@ -35,11 +35,15 @@
   .adv .v { color: #c9d1d9; min-width: 30px; display: inline-block; }
 
   /* ---- 画面 ---- */
+  /* 居中必须用 margin:auto 而不是 align-items:center：后者在内容大于容器时会把
+     顶部溢出到容器外，且滚动条够不到那一部分（flex 居中的经典陷阱），表现为
+     「画面显示不全、上面一截看不到也滚不上去」。flex:0 0 auto 防止画布被压缩。 */
   .view { flex: 1; overflow: auto; background: #0e1116; position: relative;
-    display: flex; align-items: center; justify-content: center; }
+    display: flex; }
   .view.grabbing { cursor: grabbing; }
   #screen { display: block; background: #000; box-shadow: 0 0 0 1px #262d38;
-    -webkit-user-drag: none; user-select: none; touch-action: none; }
+    -webkit-user-drag: none; user-select: none; touch-action: none;
+    margin: auto; flex: 0 0 auto; }
   .overlay { position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; flex-direction: column; gap: 10px; text-align: center;
     padding: 20px; background: rgba(14,17,22,.94); z-index: 5; }

@@ -204,7 +204,14 @@ class InputInjector(object):
 
     def _send(self, items):
         arr = (self.INPUT * len(items))(*items)
-        return self._u.SendInput(len(items), arr, ctypes.sizeof(self.INPUT))
+        n = self._u.SendInput(len(items), arr, ctypes.sizeof(self.INPUT))
+        # SendInput 返回「实际插入的事件数」。为 0 即被拒绝——最常见原因是 UIPI：
+        # 低完整性进程无法向完整性更高的窗口注入输入。它**不抛异常**，若不检查就
+        # 会静默吞掉，调用方以为注入成功，表现正是「点击无响应却查不出哪里错」。
+        if not n:
+            raise RuntimeError('SendInput 被拒绝（err=%s，通常是目标窗口权限更高）'
+                               % ctypes.GetLastError())
+        return n
 
     def _mi(self, dx, dy, data, flags):
         i = self.INPUT()
@@ -385,6 +392,56 @@ def _is_still(sig, threshold):
         return False
 
 
+def integrity_level():
+    """当前进程的完整性级别（SID 的 RID）：0x1000=Low 0x2000=Medium 0x3000=High。
+
+    UIPI 规则——低完整性进程无法向完整性更高的窗口注入输入，SendInput 会直接返回 0。
+    agent 若跑在比目标程序更低的级别上，就会「命令都发出去了、画面纹丝不动」，
+    是这个插件最难自查的一类故障，所以必须能查到。
+    """
+    try:
+        import win32api
+        import win32security
+        tok = win32security.OpenProcessToken(win32api.GetCurrentProcess(),
+                                             win32security.TOKEN_QUERY)
+        # 24 = TokenIntegrityLevel。pywin32 返回的是 PyTOKEN_MANDATORY_LABEL，
+        # 真正要的 SID 在 .Label.Sid（不同版本偶有差异，逐级回退取）
+        info = win32security.GetTokenInformation(tok, 24)
+        lab = getattr(info, 'Label', info)
+        sid = getattr(lab, 'Sid', lab)
+        if isinstance(sid, (tuple, list)):
+            sid = sid[0]
+        return win32security.ConvertSidToStringSid(sid)     # 形如 S-1-16-12288(High)
+    except Exception as e:
+        return 'err:%s' % e
+
+
+def winstation_info():
+    """当前进程所在的窗口站与桌面。
+
+    SendInput **只在交互式窗口站 WinSta0\\Default 上生效**。计划任务若以非交互方式
+    启动，进程会被放进别的窗口站，此时抓屏照样能出画面（GDI 读的是桌面 DC），
+    但注入完全无效——「画面正常、点击毫无反应」正是这个组合。
+    """
+    try:
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+
+        def _name(h):
+            buf = ctypes.create_unicode_buffer(256)
+            n = ctypes.c_ulong(0)
+            if u.GetUserObjectInformationW(h, 2, buf, 512, ctypes.byref(n)):
+                return buf.value
+            return '?'
+
+        return {
+            'winsta': _name(u.GetProcessWindowStation()),
+            'desktop': _name(u.GetThreadDesktop(k.GetCurrentThreadId())),
+        }
+    except Exception as e:
+        return {'err': str(e)}
+
+
 def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD):
     img = _STATE.screen.grab()
     sig = _signature(img)
@@ -437,6 +494,33 @@ class Handler(BaseHTTPRequestHandler):
                 'started_at': _STATE.started_at,
                 'uptime': round(time.time() - _STATE.started_at, 1),
             })
+            return
+        if path == '/diag':
+            info = {
+                'ok': True, 'pid': os.getpid(),
+                'integrity': integrity_level(),
+                'winstation': winstation_info(),
+                'screen': {'w': _STATE.screen.width, 'h': _STATE.screen.height},
+            }
+            try:
+                import win32ts
+                info['session'] = win32ts.ProcessIdToSessionId(os.getpid())
+            except Exception:
+                info['session'] = '?'
+            # 实测一次 SendInput：移到鼠标**当前**位置，不改变任何东西，只为取返回值
+            try:
+                import win32gui
+                x, y = win32gui.GetCursorPos()
+                inj = _STATE.input
+                nx, ny = inj._abs(x, y)
+                one = inj._mi(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
+                arr = (inj.INPUT * 1)(one)
+                info['sendinput_ret'] = inj._u.SendInput(
+                    1, arr, ctypes.sizeof(inj.INPUT))
+                info['sendinput_err'] = ctypes.GetLastError()
+            except Exception as e:
+                info['sendinput_error'] = str(e)
+            self._json(info)
             return
         if path == '/frame':
             try:
