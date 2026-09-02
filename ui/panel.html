@@ -71,6 +71,7 @@
   <div class="bar">
     <span class="state"><i class="dot" id="dot"></i><span id="state-txt">连接中…</span></span>
     <button id="btn-reconnect" title="断开后手动重连（也可等自动重连）">⟳ 重连</button>
+    <button id="btn-restart-agent" title="重启桌面代理进程（应用输入/绘制等修复时用到；会短暂断一下）">⟲ 重启代理</button>
     <span class="sep"></span>
     <button data-fit="1" title="缩放至适应窗口">适应</button>
     <button data-fit="0" title="按屏幕原始像素 1:1 显示">100%</button>
@@ -690,6 +691,29 @@
     setWarn('');
     lastStreamKey = '';       // 强制重建流
     poll();
+  });
+  // 重启代理：先停流，打 /agent/start（后端会先杀旧进程再拉起，确保换上新代码），
+  // 等几秒让新进程就绪后重连。画圆连直线这类只跟新代码相关的修复，靠这个按钮生效。
+  $('btn-restart-agent').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true;
+    stopStream();
+    setWarn('正在重启桌面代理…');
+    setState('wait', '重启中');
+    api('/agent/start', { method: 'POST' })
+      .then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (d) {
+        setWarn((d && d.message) ? ('已发送重启：' + d.message) : '已发送重启，稍候自动重连…');
+      })
+      .catch(function (e) { setWarn('重启请求失败：' + String(e)); })
+      .then(function () {
+        setTimeout(function () {
+          btn.disabled = false;
+          retry = 0;
+          lastStreamKey = '';
+          poll();
+        }, 2500);
+      });
   });
   window.addEventListener('resize', function () { if (fitMode) applyZoom(); });
   window.addEventListener('online', function () { $('btn-reconnect').click(); });

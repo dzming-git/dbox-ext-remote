@@ -105,6 +105,37 @@ def install():
     return True, '已设置为「%s」登录后自动启动（最高权限）' % user
 
 
+def _kill_existing():
+    """杀掉已在运行的旧 agent，确保「重启」真的换上新代码。
+
+    desktop_agent 是单实例（端口被占直接退出）。若旧进程一直占着 18921，
+    新的修复代码就永远起不来——表现正是「明明改了、推了，画圆还是一条直线」。
+    所以重启前必须先把旧进程按 pid 精确干掉（兜底再按脚本路径匹配）。"""
+    try:
+        import urllib.request, json
+        with urllib.request.urlopen('http://127.0.0.1:18921/info', timeout=1.5) as r:
+            info = json.loads(r.read().decode('utf-8', 'replace'))
+        pid = info.get('pid')
+    except Exception:
+        pid = None
+    if pid:
+        _run(['taskkill', '/f', '/pid', str(pid)])
+    # 兜底：/info 不可达但进程仍在（按 cmdline 里的脚本路径匹配）
+    try:
+        import psutil
+        script = os.path.abspath(agent_script()).lower()
+        for p in psutil.process_iter(['pid', 'cmdline']):
+            try:
+                cl = p.info.get('cmdline') or []
+                hit = any(script in (a or '').lower() for a in cl)
+                if hit and (pid is None or p.info.get('pid') != pid):
+                    _run(['taskkill', '/f', '/pid', str(p.info['pid'])])
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def uninstall():
     rc, out = _run(['schtasks', '/delete', '/tn', TASK_NAME, '/f'])
     if rc != 0 and 'not exist' not in (out or '').lower():
@@ -148,10 +179,15 @@ def start_now():
     借道任务计划程序，因为任务里登记了 `/ru <用户>`（拿到桌面）与 `/rl HIGHEST`
     （拿到足够的完整性级别注入输入）——两者缺一不可。
     不能直接用 subprocess.Popen：调用方是 LocalSystem，子进程会落在 Session 0。
+
+    启动前先杀掉旧实例：否则旧进程占着 18921 端口，新进程起不来，
+    刚推上去的修复（如画圆不再连直线）就永远不生效。
     """
+    _kill_existing()
+    _run(['schtasks', '/end', '/tn', TASK_NAME])   # 结束可能残留的「运行中」任务实例
     rc, out = _run(['schtasks', '/run', '/tn', TASK_NAME])
     if rc == 0:
-        return True, '已触发启动，稍等一两秒'
+        return True, '已重启，稍等一两秒'
     ok, msg = launch_in_user_session()          # 兜底：用用户令牌直接起
     if ok:
         return True, msg
