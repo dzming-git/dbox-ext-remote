@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>远程桌面</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #e6e9ef;
+    font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  /* ---- 工具条 ---- */
+  .bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+    background: #161b22; border-bottom: 1px solid #262d38; flex: 0 0 auto; flex-wrap: wrap; }
+  .bar button, .bar select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 7px; padding: 5px 10px; font-size: 12.5px; cursor: pointer; }
+  .bar button:hover:not(:disabled) { background: #2d333b; border-color: #3d444d; }
+  .bar button:disabled { opacity: .5; cursor: default; }
+  .bar button.on { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .bar .sep { width: 1px; height: 20px; background: #30363d; margin: 0 3px; }
+  .bar .sp { flex: 1; }
+  .state { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #8b949e; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
+  .dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb95088; }
+  .dot.err { background: #f85149; box-shadow: 0 0 6px #f8514988; }
+  .dot.wait { background: #d29922; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  /* ---- 高级参数 ---- */
+  .adv { display: flex; align-items: center; gap: 12px; padding: 8px 10px;
+    background: #12171f; border-bottom: 1px solid #262d38; flex: 0 0 auto; flex-wrap: wrap; }
+  .adv label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #8b949e; }
+  .adv input[type=range] { width: 92px; }
+  .adv input[type=number] { width: 54px; background: #21262d; color: #c9d1d9;
+    border: 1px solid #30363d; border-radius: 6px; padding: 3px 5px; font-size: 12px; }
+  .adv .v { color: #c9d1d9; min-width: 30px; display: inline-block; }
+
+  /* ---- 画面 ---- */
+  .view { flex: 1; overflow: auto; background: #0e1116; position: relative;
+    display: flex; align-items: center; justify-content: center; }
+  .view.grabbing { cursor: grabbing; }
+  #screen { display: block; image-rendering: auto; background: #000;
+    box-shadow: 0 0 0 1px #262d38; -webkit-user-drag: none; user-select: none; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; flex-direction: column; gap: 10px; text-align: center;
+    padding: 20px; background: rgba(14,17,22,.94); z-index: 5; }
+  .overlay h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .overlay p { margin: 0; font-size: 12.5px; color: #8b949e; max-width: 460px; line-height: 1.7; }
+  .overlay button { background: #1f6feb; color: #fff; border: none; border-radius: 8px;
+    padding: 8px 18px; font-size: 13px; cursor: pointer; }
+  .overlay button.ghost { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .overlay .spin { width: 22px; height: 22px; border: 2px solid #30363d;
+    border-top-color: #1f6feb; border-radius: 50%; animation: sp .8s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+
+  /* ---- 底部状态 ---- */
+  .foot { flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+    padding: 5px 10px; background: #161b22; border-top: 1px solid #262d38;
+    font-size: 11.5px; color: #6e7681; }
+  .foot .warn { color: #d29922; }
+  #kb { position: absolute; opacity: 0; width: 1px; height: 1px; left: -9999px; top: 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="bar">
+    <span class="state"><i class="dot" id="dot"></i><span id="state-txt">连接中…</span></span>
+    <button id="btn-reconnect" title="断开后手动重连（也可等自动重连）">⟳ 重连</button>
+    <span class="sep"></span>
+    <button data-fit="1" title="缩放至适应窗口">适应</button>
+    <button data-fit="0" title="按屏幕原始像素 1:1 显示">100%</button>
+    <button id="zoom-out" title="缩小">−</button>
+    <span class="state" id="zoom-val" style="min-width:44px;text-align:center">100%</span>
+    <button id="zoom-in" title="放大">＋</button>
+    <span class="sep"></span>
+    <select id="preset" title="画质与流量档位">
+      <option value="smooth">流畅</option>
+      <option value="balanced" selected>均衡</option>
+      <option value="saver">省流量</option>
+    </select>
+    <button id="btn-adv" title="展开细项调节">⚙</button>
+    <span class="sp"></span>
+    <button id="btn-fs" title="全屏">⛶</button>
+  </div>
+
+  <div class="adv" id="adv" style="display:none">
+    <label>帧率 <input type="range" id="a-fps" min="1" max="30" step="1" value="8" /><span class="v" id="v-fps">8</span></label>
+    <label>画质 <input type="range" id="a-q" min="20" max="95" step="5" value="60" /><span class="v" id="v-q">60</span></label>
+    <label>分辨率 <input type="range" id="a-scale" min="30" max="100" step="10" value="100" /><span class="v" id="v-scale">100%</span></label>
+    <label><input type="checkbox" id="a-gray" /> 灰度</label>
+    <label><input type="checkbox" id="a-still" checked /> 静止不推帧</label>
+    <button id="btn-apply">应用</button>
+    <button id="btn-reset">跟随档位</button>
+  </div>
+
+  <div class="view" id="view">
+    <img id="screen" alt="远程桌面画面" />
+    <div class="overlay" id="ov">
+      <div class="spin" id="ov-spin"></div>
+      <h3 id="ov-title">正在连接…</h3>
+      <p id="ov-text"></p>
+      <div id="ov-btns" style="display:flex;gap:8px"></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span id="f-meta">—</span>
+    <span class="sp" style="flex:1"></span>
+    <span class="warn" id="f-warn"></span>
+    <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移</span>
+  </div>
+  <textarea id="kb" autocomplete="off" spellcheck="false"></textarea>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var API = (location.pathname.replace(/\/+$/, '') || '') + '/api/ext/remote';
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---- token：优先读宿主写进 localStorage 的最新 token ----
+  var PUSHED = null;
+  window.addEventListener('message', function (e) {
+    if (e.data && e.data.type === 'DBOX_TOKEN' && e.data.token) PUSHED = e.data.token;
+  });
+  try { window.parent.postMessage({ type: 'DBOX_REQUEST_TOKEN', extId: 'remote' }, '*'); } catch (_) {}
+  function token() {
+    try {
+      return localStorage.getItem('token') || localStorage.getItem('access_token')
+        || sessionStorage.getItem('token') || PUSHED || '';
+    } catch (_) { return PUSHED || ''; }
+  }
+  function api(path, opts) {
+    opts = opts || {};
+    return fetch(API + path, Object.assign({}, opts, {
+      headers: Object.assign({ 'Authorization': 'Bearer ' + token() }, opts.headers || {}),
+    }));
+  }
+
+  // ---- 状态 ----
+  var PRESETS = {
+    smooth:   { fps: 15, q: 72, scale: 100, gray: false, still: false },
+    balanced: { fps: 8,  q: 60, scale: 100, gray: false, still: true },
+    saver:    { fps: 3,  q: 42, scale: 70,  gray: false, still: true },
+  };
+  var cfg = Object.assign({}, PRESETS.balanced);
+  var presetName = 'balanced';
+  var screenW = 0, screenH = 0;
+  var zoom = 1, fitMode = true;
+  var online = false, autostart = false;
+  var retry = 0, retryTimer = null;
+  var pollTimer = null;
+
+  var view = $('view'), img = $('screen'), ov = $('ov');
+
+  // ---------------------------------------------------------------- 画面流
+  function streamURL() {
+    return API + '/stream?token=' + encodeURIComponent(token())
+      + '&fps=' + cfg.fps + '&q=' + cfg.q + '&scale=' + (cfg.scale / 100)
+      + '&gray=' + (cfg.gray ? 1 : 0) + '&still=' + (cfg.still ? 1 : 0)
+      + '&_t=' + Date.now();
+  }
+
+  function setStream() {
+    if (!online) return;
+    // 换 src 即可强制重建连接：参数变了（档位/缩放画质）或手动重连都走这条路
+    img.src = streamURL();
+  }
+
+  function scheduleRetry() {
+    if (retryTimer) return;
+    // 指数退避，上限 15s：网络抖动时别把服务端和浏览器都打满
+    var wait = Math.min(15000, 1000 * Math.pow(2, Math.min(retry, 4)));
+    retry++;
+    setWarn('连接中断，' + Math.round(wait / 1000) + 's 后自动重连…（也可点「重连」）');
+    setState('wait', '重连中');
+    retryTimer = setTimeout(function () {
+      retryTimer = null;
+      setStream();
+    }, wait);
+  }
+
+  img.addEventListener('load', function () {
+    retry = 0;
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    setWarn('');
+    if (online) setState('on', '已连接');
+  });
+  img.addEventListener('error', function () {
+    // 流中断（断网 / 代理掉线 / 服务重启）都会走到这里
+    setState('err', '已断开');
+    scheduleRetry();
+  });
+
+  function setState(kind, text) {
+    var d = $('dot');
+    d.className = 'dot' + (kind === 'on' ? ' on' : kind === 'err' ? ' err' : kind === 'wait' ? ' wait' : '');
+    $('state-txt').textContent = text;
+  }
+  function setWarn(t) { $('f-warn').textContent = t || ''; }
+
+  // ---------------------------------------------------------------- 缩放
+  function applyZoom() {
+    if (!screenW) return;
+    if (fitMode) {
+      var r = view.getBoundingClientRect();
+      var s = Math.min(r.width / screenW, r.height / screenH);
+      zoom = Math.max(0.1, Math.min(s, 1));
+    }
+    img.style.width = Math.round(screenW * zoom) + 'px';
+    img.style.height = Math.round(screenH * zoom) + 'px';
+    $('zoom-val').textContent = Math.round(zoom * 100) + '%';
+  }
+  function setZoom(z, keepFit) {
+    fitMode = !!keepFit;
+    zoom = Math.max(0.25, Math.min(4, z));
+    applyZoom();
+  }
+  $('zoom-in').addEventListener('click', function () { setZoom(zoom * 1.25, false); });
+  $('zoom-out').addEventListener('click', function () { setZoom(zoom / 1.25, false); });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-fit]'), function (b) {
+    b.addEventListener('click', function () {
+      if (b.dataset.fit === '1') { fitMode = true; applyZoom(); }
+      else { fitMode = false; setZoom(1, false); }
+    });
+  });
+  $('btn-fs').addEventListener('click', function () {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (view.requestFullscreen) view.requestFullscreen();
+  });
+
+  // ---------------------------------------------------------------- 输入
+  var MOVE_MS = 30;          // 鼠标移动节流：再密也没有意义，只会白烧流量
+  var lastMove = 0, pending = null, composing = false;
+
+  function send(ev) {
+    if (!online) return;
+    fetch(API + '/input', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(ev),
+    }).catch(function () {});
+  }
+
+  // 画布坐标 → 屏幕坐标。img 的 CSS 尺寸就是「屏幕尺寸 × zoom」，
+  // 所以按显示宽度归一化即可，缩放后无需额外换算。
+  function toScreen(cx, cy) {
+    var r = img.getBoundingClientRect();
+    if (!r.width || !screenW) return null;
+    return {
+      x: Math.round((cx - r.left) / r.width * screenW),
+      y: Math.round((cy - r.top) / r.height * screenH),
+    };
+  }
+
+  img.addEventListener('mousemove', function (e) {
+    var p = toScreen(e.clientX, e.clientY);
+    if (!p) return;
+    var now = Date.now();
+    pending = p;
+    if (now - lastMove < MOVE_MS) return;
+    lastMove = now;
+    send({ type: 'mouse_move', x: p.x, y: p.y, });
+  });
+  setInterval(function () {          // 收尾：停手后补发最后一个位置，避免差半格
+    if (pending) { send({ type: 'mouse_move', x: pending.x, y: pending.y }); pending = null; }
+  }, MOVE_MS * 2);
+
+  img.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    var p = toScreen(e.clientX, e.clientY);
+    if (!p) return;
+    if (e.button === 1) { startPan(e); return; }   // 中键：本地平移，不发给远程
+    send({ type: 'mouse_down', x: p.x, y: p.y, button: btnName(e.button) });
+  });
+  window.addEventListener('mouseup', function (e) {
+    var p = toScreen(e.clientX, e.clientY);
+    if (p) send({ type: 'mouse_up', x: p.x, y: p.y, button: btnName(e.button) });
+  });
+  img.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  img.addEventListener('wheel', function (e) {
+    if (e.ctrlKey) {                  // Ctrl+滚轮 = 本地缩放，远程无感
+      e.preventDefault();
+      setZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12), false);
+      return;
+    }
+    e.preventDefault();
+    send({ type: 'wheel', dx: e.deltaX, dy: -e.deltaY });
+  }, { passive: false });
+
+  function btnName(b) { return b === 2 ? 'right' : b === 1 ? 'middle' : 'left'; }
+
+  // 中键拖拽平移（缩放后画面大于视口时）
+  var pan = null;
+  function startPan(e) {
+    pan = { x: e.clientX, y: e.clientY, sl: view.scrollLeft, st: view.scrollTop };
+    view.classList.add('grabbing');
+    e.preventDefault();
+  }
+  window.addEventListener('mousemove', function (e) {
+    if (!pan) return;
+    view.scrollLeft = pan.sl - (e.clientX - pan.x);
+    view.scrollTop = pan.st - (e.clientY - pan.y);
+  });
+  window.addEventListener('mouseup', function () { pan = null; view.classList.remove('grabbing'); });
+
+  // ---- 键盘：隐藏 textarea 接管，中文等输入法内容才能正确上屏 ----
+  var kb = $('kb');
+  img.addEventListener('click', function () { kb.focus({ preventScroll: true }); });
+  var SPECIAL = {
+    enter: 1, backspace: 1, tab: 1, escape: 1, esc: 1, delete: 1, insert: 1,
+    home: 1, end: 1, pageup: 1, pagedown: 1, arrowleft: 1, arrowup: 1,
+    arrowright: 1, arrowdown: 1, space: 1, capslock: 1, printscreen: 1,
+  };
+  kb.addEventListener('compositionstart', function () { composing = true; });
+  kb.addEventListener('compositionend', function (e) {
+    composing = false;
+    if (e.data) send({ type: 'text', text: e.data });
+    kb.value = '';
+  });
+  kb.addEventListener('keydown', function (e) {
+    if (composing) return;                    // 输入法组合中：交给 compositionend
+    var k = (e.key || '').toLowerCase();
+    if (SPECIAL[k] || e.ctrlKey || e.altKey || e.metaKey) {
+      e.preventDefault();
+      send({ type: 'key', key: k, ctrl: e.ctrlKey, alt: e.altKey,
+             shift: e.shiftKey, meta: e.metaKey });
+      return;
+    }
+    if (e.key && e.key.length === 1) {
+      e.preventDefault();                     // 不落进 textarea，避免重复上屏
+      send({ type: 'text', text: e.key });
+    }
+  });
+
+  // 触摸端：单指拖动＝移动，点击＝左键，双指＝右键
+  var touch = null;
+  img.addEventListener('touchstart', function (e) {
+    var t = e.touches[0];
+    var p = toScreen(t.clientX, t.clientY);
+    if (!p) return;
+    if (e.touches.length >= 2) { send({ type: 'mouse_click', x: p.x, y: p.y, button: 'right' }); return; }
+    touch = { t: Date.now(), p: p };
+    send({ type: 'mouse_move', x: p.x, y: p.y });
+    e.preventDefault();
+  }, { passive: false });
+  img.addEventListener('touchmove', function (e) {
+    var t = e.touches[0];
+    var p = toScreen(t.clientX, t.clientY);
+    if (p) send({ type: 'mouse_move', x: p.x, y: p.y });
+    e.preventDefault();
+  }, { passive: false });
+  img.addEventListener('touchend', function () {
+    if (touch && Date.now() - touch.t < 260) {
+      send({ type: 'mouse_click', x: touch.p.x, y: touch.p.y, button: 'left', clicks: 1 });
+    }
+    touch = null;
+  });
+
+  // ---------------------------------------------------------------- 档位 / 细项
+  function fillAdv() {
+    $('a-fps').value = cfg.fps; $('v-fps').textContent = cfg.fps;
+    $('a-q').value = cfg.q; $('v-q').textContent = cfg.q;
+    $('a-scale').value = cfg.scale; $('v-scale').textContent = cfg.scale + '%';
+    $('a-gray').checked = !!cfg.gray;
+    $('a-still').checked = !!cfg.still;
+  }
+  function readAdv() {
+    cfg.fps = +$('a-fps').value; cfg.q = +$('a-q').value;
+    cfg.scale = +$('a-scale').value; cfg.gray = $('a-gray').checked;
+    cfg.still = $('a-still').checked;
+  }
+  $('btn-adv').addEventListener('click', function () {
+    var p = $('adv');
+    var show = p.style.display === 'none';
+    p.style.display = show ? '' : 'none';
+    this.classList.toggle('on', show);
+  });
+  $('a-fps').addEventListener('input', function () { $('v-fps').textContent = this.value; });
+  $('a-q').addEventListener('input', function () { $('v-q').textContent = this.value; });
+  $('a-scale').addEventListener('input', function () { $('v-scale').textContent = this.value + '%'; });
+  $('btn-apply').addEventListener('click', function () { readAdv(); setStream(); updateMeta(); });
+  $('btn-reset').addEventListener('click', function () {
+    cfg = Object.assign({}, PRESETS[presetName] || PRESETS.balanced);
+    fillAdv(); setStream(); updateMeta();
+  });
+  $('preset').addEventListener('change', function () {
+    presetName = this.value;
+    cfg = Object.assign({}, PRESETS[presetName] || PRESETS.balanced);
+    fillAdv(); setStream(); updateMeta();
+  });
+
+  function updateMeta() {
+    var bits = [];
+    if (screenW) bits.push(screenW + '×' + screenH);
+    bits.push(cfg.fps + 'fps');
+    bits.push('质量 ' + cfg.q);
+    if (cfg.scale < 100) bits.push('分辨率 ' + cfg.scale + '%');
+    if (cfg.gray) bits.push('灰度');
+    if (cfg.still) bits.push('静止不推帧');
+    bits.push('缩放 ' + Math.round(zoom * 100) + '%');
+    $('f-meta').textContent = bits.join(' · ');
+  }
+
+  // ---------------------------------------------------------------- 引导 / 状态轮询
+  function showOverlay(title, text, btns, spin) {
+    $('ov-title').textContent = title;
+    $('ov-text').innerHTML = text || '';
+    $('ov-spin').style.display = spin === false ? 'none' : '';
+    var box = $('ov-btns');
+    box.innerHTML = '';
+    (btns || []).forEach(function (b) {
+      var el = document.createElement('button');
+      el.textContent = b.text;
+      if (b.ghost) el.className = 'ghost';
+      el.addEventListener('click', b.onClick);
+      box.appendChild(el);
+    });
+    ov.style.display = '';
+  }
+  function hideOverlay() { ov.style.display = 'none'; }
+
+  function agentGuide(err) {
+    var btns = [{
+      text: autostart ? '立即启动代理' : '安装开机自启并启动',
+      onClick: function () {
+        showOverlay('正在启动…', '', [], true);
+        api('/agent/install', { method: 'POST' }).then(function () {
+          setTimeout(poll, 1200);
+        }).catch(function () { setTimeout(poll, 1200); });
+      },
+    }];
+    showOverlay('桌面代理未运行',
+      '画面采集与鼠标键盘注入必须由运行在<b>登录会话</b>里的代理进程完成——'
+      + 'Dbox 服务本身被 Windows 隔离在没有桌面的 Session 0，抓不到任何画面。<br><br>'
+      + '点击下方按钮把它设为「登录时自动启动」（Windows 计划任务），之后每次开机都会自动就绪。'
+      + (err ? '<br><span style="color:#6e7681">服务端返回：' + err + '</span>' : ''),
+      btns, false);
+  }
+
+  var lastStreamKey = '';
+  function poll() {
+    api('/status').then(function (r) { return r.json(); }).then(function (d) {
+      if (!d || !d.success) return;
+      autostart = !!d.autostart;
+      if (d.online && d.info && d.info.screen) {
+        online = true;
+        var sw = d.info.screen.w, sh = d.info.screen.h;
+        var changed = (sw !== screenW || sh !== screenH);
+        screenW = sw; screenH = sh;
+        hideOverlay();
+        if (d.presets) PRESETS = d.presets;
+        var key = [cfg.fps, cfg.q, cfg.scale, cfg.gray, cfg.still].join('|');
+        // 只在「首次连上」「分辨率变了」「档位变了」时重建流——
+        // 否则轮询会不停打断正在看的画面
+        if (changed || key !== lastStreamKey) {
+          lastStreamKey = key;
+          setStream();
+          applyZoom();
+        }
+        if (!retryTimer) setState(img.complete && img.naturalWidth ? 'on' : 'wait',
+                                 img.complete && img.naturalWidth ? '已连接' : '缓冲中');
+        updateMeta();
+      } else {
+        online = false;
+        agentGuide(d.error || '');
+        setState('err', '代理未运行');
+      }
+    }).catch(function () {
+      online = false;
+      setState('err', '服务不可达');
+      showOverlay('无法连接', '请确认 Dbox 正在运行。稍后自动重试。', [], true);
+    }).then(function () {
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, online ? 3000 : 1500);
+    });
+  }
+
+  $('btn-reconnect').addEventListener('click', function () {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    retry = 0;
+    setWarn('');
+    lastStreamKey = '';       // 强制重建流
+    poll();
+  });
+  window.addEventListener('resize', function () { if (fitMode) applyZoom(); });
+  window.addEventListener('online', function () { $('btn-reconnect').click(); });
+
+  fillAdv();
+  poll();
+  setTimeout(function () { kb.focus({ preventScroll: true }); }, 300);
+})();
+</script>
+</body>
+</html>

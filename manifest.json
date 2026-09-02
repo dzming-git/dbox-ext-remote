@@ -1,0 +1,18 @@
+{
+  "id": "remote",
+  "name": "远程桌面",
+  "description": "通过浏览器远程控制运行 Dbox 的这台 Windows：实时画面、鼠标键盘操作、缩放查看、省流量模式。采用双进程结构——画面采集与输入注入必须由运行在登录会话里的「桌面代理」完成（Windows 服务被隔离在 Session 0，看不到用户桌面），插件后端只做鉴权与转发。首次使用需在面板里点一次「安装自启」，之后开机自动就绪。仅监听本机，需登录后方可使用。",
+  "timeout": 600,
+  "enabled": true,
+  "backend": {
+    "url_prefix": "/api/ext/remote"
+  },
+  "ui": {
+    "mount": "floating",
+    "title": "远程桌面",
+    "icon": "R",
+    "entry": "panel.html",
+    "needs_credential": false,
+    "sandbox": "allow-scripts allow-same-origin allow-forms allow-popups"
+  }
+}
