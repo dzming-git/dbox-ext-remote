@@ -32,16 +32,14 @@
     background: #12171f; border-bottom: 1px solid #262d38; flex: 0 0 auto; flex-wrap: wrap; }
   .adv label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #8b949e; }
   .adv input[type=range] { width: 92px; }
-  .adv input[type=number] { width: 54px; background: #21262d; color: #c9d1d9;
-    border: 1px solid #30363d; border-radius: 6px; padding: 3px 5px; font-size: 12px; }
   .adv .v { color: #c9d1d9; min-width: 30px; display: inline-block; }
 
   /* ---- 画面 ---- */
   .view { flex: 1; overflow: auto; background: #0e1116; position: relative;
     display: flex; align-items: center; justify-content: center; }
   .view.grabbing { cursor: grabbing; }
-  #screen { display: block; image-rendering: auto; background: #000;
-    box-shadow: 0 0 0 1px #262d38; -webkit-user-drag: none; user-select: none; }
+  #screen { display: block; background: #000; box-shadow: 0 0 0 1px #262d38;
+    -webkit-user-drag: none; user-select: none; touch-action: none; }
   .overlay { position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; flex-direction: column; gap: 10px; text-align: center;
     padding: 20px; background: rgba(14,17,22,.94); z-index: 5; }
@@ -59,6 +57,7 @@
     padding: 5px 10px; background: #161b22; border-top: 1px solid #262d38;
     font-size: 11.5px; color: #6e7681; }
   .foot .warn { color: #d29922; }
+  .foot .sp { flex: 1; }
   #kb { position: absolute; opacity: 0; width: 1px; height: 1px; left: -9999px; top: 0; }
 </style>
 </head>
@@ -95,7 +94,7 @@
   </div>
 
   <div class="view" id="view">
-    <img id="screen" alt="远程桌面画面" />
+    <canvas id="screen"></canvas>
     <div class="overlay" id="ov">
       <div class="spin" id="ov-spin"></div>
       <h3 id="ov-title">正在连接…</h3>
@@ -106,7 +105,7 @@
 
   <div class="foot">
     <span id="f-meta">—</span>
-    <span class="sp" style="flex:1"></span>
+    <span class="sp"></span>
     <span class="warn" id="f-warn"></span>
     <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移</span>
   </div>
@@ -155,15 +154,24 @@
   };
   var cfg = Object.assign({}, PRESETS.balanced);
   var presetName = 'balanced';
-  var screenW = 0, screenH = 0;
+  var screenW = 0, screenH = 0;      // 屏幕真实尺寸（用于坐标映射，取自 /status）
   var zoom = 1, fitMode = true;
   var online = false, autostart = false;
-  var retry = 0, retryTimer = null;
-  var pollTimer = null;
+  var retry = 0, retryTimer = null, pollTimer = null;
 
-  var view = $('view'), img = $('screen'), ov = $('ov');
+  var view = $('view');
+  var canvas = $('screen');
+  var ctx = canvas.getContext('2d');
+  var ov = $('ov');
 
   // ---------------------------------------------------------------- 画面流
+  // 不用 <img src=流>：multipart/x-mixed-replace 在 <img> 里既不触发 load 也不触发
+  // error，收没收到帧、卡在哪一步完全无从判断，出问题只能看到一片黑。
+  // 改为 fetch + ReadableStream 自己读：每一帧都由代码解析并画进 canvas，
+  // 于是「是否连上、帧率多少、每秒多少流量」都是可知的——省流量档位尤其需要这些数字。
+  var streamCtl = null;
+  var stat = { frames: 0, bytes: 0, lastSec: 0, fps: 0, kbps: 0 };
+
   function streamURL() {
     return API + '/stream?token=' + encodeURIComponent(token())
       + '&fps=' + cfg.fps + '&q=' + cfg.q + '&scale=' + (cfg.scale / 100)
@@ -171,36 +179,107 @@
       + '&_t=' + Date.now();
   }
 
-  function setStream() {
+  function stopStream() {
+    if (streamCtl) { try { streamCtl.abort(); } catch (_) {} streamCtl = null; }
+  }
+
+  function concatU8(a, b) {
+    var out = new Uint8Array(a.length + b.length);
+    out.set(a, 0); out.set(b, a.length);
+    return out;
+  }
+  function idxOf(u8, s, from) {
+    var n = s.length, lim = u8.length - n, c0 = s.charCodeAt(0);
+    for (var i = (from || 0); i <= lim; i++) {
+      if (u8[i] !== c0) continue;
+      var ok = true;
+      for (var j = 1; j < n; j++) { if (u8[i + j] !== s.charCodeAt(j)) { ok = false; break; } }
+      if (ok) return i;
+    }
+    return -1;
+  }
+  // 从缓冲里切出完整帧：--frame\r\n<headers>\r\n\r\n<数据>
+  function splitFrames(u8) {
+    var frames = [], start = 0;
+    for (;;) {
+      var i = idxOf(u8, '--frame', start);
+      if (i < 0) break;
+      var he = idxOf(u8, '\r\n\r\n', i);
+      if (he < 0) break;
+      var hdr = String.fromCharCode.apply(null, u8.subarray(i, he));
+      var m = /Content-Length:\s*(\d+)/i.exec(hdr);
+      if (!m) { start = i + 7; continue; }
+      var len = parseInt(m[1], 10);
+      var ds = he + 4;
+      if (u8.length < ds + len) break;          // 数据没到齐，等下一块
+      frames.push(u8.subarray(ds, ds + len));
+      start = ds + len;
+    }
+    return { frames: frames, rest: u8.subarray(start) };
+  }
+
+  async function drawFrame(u8) {
+    try {
+      var bmp = await createImageBitmap(new Blob([u8], { type: 'image/jpeg' }));
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+      stat.frames++;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function startStream() {
+    stopStream();
     if (!online) return;
-    // 换 src 即可强制重建连接：参数变了（档位/缩放画质）或手动重连都走这条路
-    img.src = streamURL();
+    var ctl = new AbortController();
+    streamCtl = ctl;
+    setState('wait', '连接中');
+    try {
+      var resp = await fetch(streamURL(), { signal: ctl.signal, cache: 'no-store' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      var reader = resp.body.getReader();
+      var buf = new Uint8Array(0);
+      while (!ctl.signal.aborted) {
+        var r = await reader.read();
+        if (r.done) throw new Error('流已结束');
+        stat.bytes += r.value.length;
+        buf = concatU8(buf, r.value);
+        var res = splitFrames(buf);
+        buf = res.rest;
+        for (var i = 0; i < res.frames.length; i++) {
+          if (await drawFrame(res.frames[i])) {
+            retry = 0;
+            setWarn('');
+            setState('on', '已连接');
+          }
+        }
+        // 缓冲只留最后一个未完整帧，避免长时间运行后无限增长
+        if (buf.length > 4 * 1024 * 1024) buf = new Uint8Array(0);
+      }
+    } catch (e) {
+      if (ctl.signal.aborted) return;      // 主动停止（换档位 / 重连），不算断线
+      setState('err', '已断开');
+      scheduleRetry();
+    }
   }
 
   function scheduleRetry() {
     if (retryTimer) return;
-    // 指数退避，上限 15s：网络抖动时别把服务端和浏览器都打满
     var wait = Math.min(15000, 1000 * Math.pow(2, Math.min(retry, 4)));
     retry++;
     setWarn('连接中断，' + Math.round(wait / 1000) + 's 后自动重连…（也可点「重连」）');
     setState('wait', '重连中');
     retryTimer = setTimeout(function () {
       retryTimer = null;
-      setStream();
+      startStream();
     }, wait);
   }
-
-  img.addEventListener('load', function () {
-    retry = 0;
-    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    setWarn('');
-    if (online) setState('on', '已连接');
-  });
-  img.addEventListener('error', function () {
-    // 流中断（断网 / 代理掉线 / 服务重启）都会走到这里
-    setState('err', '已断开');
-    scheduleRetry();
-  });
 
   function setState(kind, text) {
     var d = $('dot');
@@ -217,9 +296,10 @@
       var s = Math.min(r.width / screenW, r.height / screenH);
       zoom = Math.max(0.1, Math.min(s, 1));
     }
-    img.style.width = Math.round(screenW * zoom) + 'px';
-    img.style.height = Math.round(screenH * zoom) + 'px';
+    canvas.style.width = Math.round(screenW * zoom) + 'px';
+    canvas.style.height = Math.round(screenH * zoom) + 'px';
     $('zoom-val').textContent = Math.round(zoom * 100) + '%';
+    updateMeta();
   }
   function setZoom(z, keepFit) {
     fitMode = !!keepFit;
@@ -252,10 +332,10 @@
     }).catch(function () {});
   }
 
-  // 画布坐标 → 屏幕坐标。img 的 CSS 尺寸就是「屏幕尺寸 × zoom」，
+  // 画布坐标 → 屏幕坐标。canvas 的 CSS 尺寸就是「屏幕尺寸 × zoom」，
   // 所以按显示宽度归一化即可，缩放后无需额外换算。
   function toScreen(cx, cy) {
-    var r = img.getBoundingClientRect();
+    var r = canvas.getBoundingClientRect();
     if (!r.width || !screenW) return null;
     return {
       x: Math.round((cx - r.left) / r.width * screenW),
@@ -263,20 +343,20 @@
     };
   }
 
-  img.addEventListener('mousemove', function (e) {
+  canvas.addEventListener('mousemove', function (e) {
     var p = toScreen(e.clientX, e.clientY);
     if (!p) return;
     var now = Date.now();
     pending = p;
     if (now - lastMove < MOVE_MS) return;
     lastMove = now;
-    send({ type: 'mouse_move', x: p.x, y: p.y, });
+    send({ type: 'mouse_move', x: p.x, y: p.y });
   });
   setInterval(function () {          // 收尾：停手后补发最后一个位置，避免差半格
     if (pending) { send({ type: 'mouse_move', x: pending.x, y: pending.y }); pending = null; }
   }, MOVE_MS * 2);
 
-  img.addEventListener('mousedown', function (e) {
+  canvas.addEventListener('mousedown', function (e) {
     e.preventDefault();
     var p = toScreen(e.clientX, e.clientY);
     if (!p) return;
@@ -287,8 +367,8 @@
     var p = toScreen(e.clientX, e.clientY);
     if (p) send({ type: 'mouse_up', x: p.x, y: p.y, button: btnName(e.button) });
   });
-  img.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-  img.addEventListener('wheel', function (e) {
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  canvas.addEventListener('wheel', function (e) {
     if (e.ctrlKey) {                  // Ctrl+滚轮 = 本地缩放，远程无感
       e.preventDefault();
       setZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12), false);
@@ -300,7 +380,6 @@
 
   function btnName(b) { return b === 2 ? 'right' : b === 1 ? 'middle' : 'left'; }
 
-  // 中键拖拽平移（缩放后画面大于视口时）
   var pan = null;
   function startPan(e) {
     pan = { x: e.clientX, y: e.clientY, sl: view.scrollLeft, st: view.scrollTop };
@@ -316,7 +395,7 @@
 
   // ---- 键盘：隐藏 textarea 接管，中文等输入法内容才能正确上屏 ----
   var kb = $('kb');
-  img.addEventListener('click', function () { kb.focus({ preventScroll: true }); });
+  canvas.addEventListener('click', function () { kb.focus({ preventScroll: true }); });
   var SPECIAL = {
     enter: 1, backspace: 1, tab: 1, escape: 1, esc: 1, delete: 1, insert: 1,
     home: 1, end: 1, pageup: 1, pagedown: 1, arrowleft: 1, arrowup: 1,
@@ -343,9 +422,9 @@
     }
   });
 
-  // 触摸端：单指拖动＝移动，点击＝左键，双指＝右键
+  // 触摸端：单指拖动＝移动，轻点＝左键，双指＝右键
   var touch = null;
-  img.addEventListener('touchstart', function (e) {
+  canvas.addEventListener('touchstart', function (e) {
     var t = e.touches[0];
     var p = toScreen(t.clientX, t.clientY);
     if (!p) return;
@@ -354,13 +433,13 @@
     send({ type: 'mouse_move', x: p.x, y: p.y });
     e.preventDefault();
   }, { passive: false });
-  img.addEventListener('touchmove', function (e) {
+  canvas.addEventListener('touchmove', function (e) {
     var t = e.touches[0];
     var p = toScreen(t.clientX, t.clientY);
     if (p) send({ type: 'mouse_move', x: p.x, y: p.y });
     e.preventDefault();
   }, { passive: false });
-  img.addEventListener('touchend', function () {
+  canvas.addEventListener('touchend', function () {
     if (touch && Date.now() - touch.t < 260) {
       send({ type: 'mouse_click', x: touch.p.x, y: touch.p.y, button: 'left', clicks: 1 });
     }
@@ -389,15 +468,15 @@
   $('a-fps').addEventListener('input', function () { $('v-fps').textContent = this.value; });
   $('a-q').addEventListener('input', function () { $('v-q').textContent = this.value; });
   $('a-scale').addEventListener('input', function () { $('v-scale').textContent = this.value + '%'; });
-  $('btn-apply').addEventListener('click', function () { readAdv(); setStream(); updateMeta(); });
+  $('btn-apply').addEventListener('click', function () { readAdv(); startStream(); updateMeta(); });
   $('btn-reset').addEventListener('click', function () {
     cfg = Object.assign({}, PRESETS[presetName] || PRESETS.balanced);
-    fillAdv(); setStream(); updateMeta();
+    fillAdv(); startStream(); updateMeta();
   });
   $('preset').addEventListener('change', function () {
     presetName = this.value;
     cfg = Object.assign({}, PRESETS[presetName] || PRESETS.balanced);
-    fillAdv(); setStream(); updateMeta();
+    fillAdv(); startStream(); updateMeta();
   });
 
   function updateMeta() {
@@ -409,8 +488,21 @@
     if (cfg.gray) bits.push('灰度');
     if (cfg.still) bits.push('静止不推帧');
     bits.push('缩放 ' + Math.round(zoom * 100) + '%');
+    if (stat.fps || stat.kbps) bits.push('实测 ' + stat.fps + 'fps · ' + stat.kbps + ' KB/s');
     $('f-meta').textContent = bits.join(' · ');
   }
+
+  // 每秒算一次实测帧率与码率——省流量档位下这两个数字才是判断依据
+  var _lastSnap = { t: Date.now(), f: 0, b: 0 };
+  setInterval(function () {
+    var now = Date.now();
+    var dt = (now - _lastSnap.t) / 1000;
+    if (dt < 0.9) return;
+    stat.fps = Math.round((stat.frames - _lastSnap.f) / dt);
+    stat.kbps = Math.round((stat.bytes - _lastSnap.b) / 1024 / dt);
+    _lastSnap = { t: now, f: stat.frames, b: stat.bytes };
+    updateMeta();
+  }, 1000);
 
   // ---------------------------------------------------------------- 引导 / 状态轮询
   function showOverlay(title, text, btns, spin) {
@@ -458,7 +550,7 @@
       '画面采集与鼠标键盘注入必须由运行在<b>登录会话</b>里的代理进程完成——'
       + 'Dbox 服务本身被 Windows 隔离在没有桌面的 Session 0，抓不到任何画面。<br><br>'
       + '点击下方按钮把它设为「登录时自动启动」（Windows 计划任务），之后每次开机都会自动就绪。'
-      + (err ? '<br><span style="color:#6e7681">服务端返回：' + err + '</span>' : ''),
+      + (err ? '<br><span style="color:#6e7681">服务端返回：' + esc(err) + '</span>' : ''),
       btns, false);
   }
 
@@ -479,19 +571,19 @@
         // 否则轮询会不停打断正在看的画面
         if (changed || key !== lastStreamKey) {
           lastStreamKey = key;
-          setStream();
           applyZoom();
+          startStream();
         }
-        if (!retryTimer) setState(img.complete && img.naturalWidth ? 'on' : 'wait',
-                                 img.complete && img.naturalWidth ? '已连接' : '缓冲中');
         updateMeta();
       } else {
         online = false;
+        stopStream();
         agentGuide(d.error || '');
         setState('err', '代理未运行');
       }
     }).catch(function () {
       online = false;
+      stopStream();
       setState('err', '服务不可达');
       showOverlay('无法连接', '请确认 Dbox 正在运行。稍后自动重试。', [], true);
     }).then(function () {
