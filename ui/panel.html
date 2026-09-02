@@ -454,7 +454,15 @@
       clearTimeout(lpTimer);
       if (touch && touch.down && !suppressUp) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
       touch = null; suppressUp = false;
-      pinch = { d0: tdist(e.touches[0], e.touches[1]), z0: zoom };
+      var pa = e.touches[0], pb = e.touches[1];
+      var pr = canvas.getBoundingClientRect();
+      var pf0 = tmid(pa, pb);
+      pinch = {
+        d0: tdist(pa, pb), z0: zoom,
+        // 手势开始时手指中心下的远端内容坐标（固定锚点），平移/缩放都围绕它
+        cx0: (pf0.x - pr.left) / zoom,
+        cy0: (pf0.y - pr.top) / zoom
+      };
       return;
     }
     var t = e.touches[0];
@@ -479,14 +487,12 @@
       var a = e.touches[0], b = e.touches[1];
       var nz = Math.max(0.25, Math.min(4, pinch.z0 * tdist(a, b) / (pinch.d0 || 1)));
       var fx = tmid(a, b).x, fy = tmid(a, b).y;
-      var Lc = canvas.getBoundingClientRect();    // 缩放前画布实时位置（含居中 margin）
-      var cx = (fx - Lc.left) / zoom;             // 手指中心下的远端内容坐标（缩放前）
-      var cy = (fy - Lc.top) / zoom;
       setZoom(nz, false);                          // 改尺寸；fitMode 关闭后不改变滚动
       var L2 = canvas.getBoundingClientRect();    // 缩放后画布实时位置（margin 可能变化）
-      // 让「手指中心下的那一点内容」仍停在手指中心 ⇒ 反推应滚动到哪
-      view.scrollLeft = view.scrollLeft + L2.left - fx + cx * nz;
-      view.scrollTop = view.scrollTop + L2.top - fy + cy * nz;
+      // 锚点 cx0/cy0 是手势开始时手指中心下的内容，让它始终停在手指中心：
+      // 既实现「捏合围绕手指放大」，又实现「双指平移时内容跟随手指」
+      view.scrollLeft = view.scrollLeft + L2.left - fx + pinch.cx0 * nz;
+      view.scrollTop = view.scrollTop + L2.top - fy + pinch.cy0 * nz;
       return;
     }
     if (touch && e.touches.length === 1) {
