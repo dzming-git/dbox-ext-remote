@@ -211,6 +211,9 @@ class InputInjector(object):
         class INPUT(ctypes.Structure):
             _fields_ = [('type', ctypes.c_ulong), ('u', UNION)]
 
+        class POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
         self.MOUSEINPUT = MOUSEINPUT
         self.KEYBDINPUT = KEYBDINPUT
         self.INPUT = INPUT
@@ -270,17 +273,34 @@ class InputInjector(object):
         ny = int(max(0, min(65535, y * 65535 // vh)))
         return nx, ny
 
+    def _cursor_pos(self):
+        """当前光标位置（物理像素，与 SetCursorPos / 前端 screen 坐标同一坐标系）。"""
+        pt = self.POINT()
+        try:
+            if self._u.GetCursorPos(ctypes.byref(pt)):
+                return pt.x, pt.y
+        except Exception:
+            pass
+        return 0, 0
+
     def mouse_move(self, x, y):
-        # SetCursorPos 把光标精确移到物理像素位置（无 65535/虚拟化天花板偏移，见上方说明）。
-        # 但 SetCursorPos 不会向目标窗口派发 WM_MOUSEMOVE——画图这类「在 mousemove 上连线」
-        # 的程序只会拿到按下/抬起两个位置，画出来就是一条直线。所以再补一条绝对坐标的
-        # 鼠标移动 INPUT 事件（MOUSEEVENTF_VIRTUALDESK + _abs 物理归一化，全屏精确）来
-        # 真正触发 WM_MOUSEMOVE，使拖拽/手绘能连续落点。
-        self._u.SetCursorPos(int(x), int(y))
-        nx, ny = self._abs(int(x), int(y))
-        self._send([self._mi(nx, ny, 0,
-                              MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
-                              | MOUSEEVENTF_VIRTUALDESK)])
+        # 必须先发「相对移动」再 SetCursorPos 精确归位，二者缺一不可：
+        # ① SetCursorPos 只移光标、不向目标窗口派发 WM_MOUSEMOVE——画图这类「在
+        #    mousemove 上连线」的程序只会拿到按下/抬起两个位置，画出来就是一条直线。
+        # ② 但若在 SetCursorPos 之后补发「绝对坐标的移动事件」，由于光标已停在目标点，
+        #    OS 认为没有位移，照样不派发 WM_MOUSEMOVE（此前这版正是死在这个坑里）。
+        # ③ 真正能稳定触发 WM_MOUSEMOVE 的是「相对位移」：从当前光标算 delta 注入，
+        #    光标确实发生了位移 → 必然派发消息 → 拖拽/手绘才能连续落点。相对位移作用在
+        #    物理光标坐标上，不受 DPI 虚拟化天花板限制，整块屏幕都可达（绝对移动在 125%
+        #    缩放下右侧/底部约 0.8× 区域物理上不可达，会画歪）。
+        # ④ 相对位移可能因系统「鼠标加速」产生微小漂移，最后用 SetCursorPos 精确归位，
+        #    既保证落点准确，又让下一帧的 delta 从正确位置算起、不累积误差。
+        cx, cy = self._cursor_pos()
+        dx = int(x) - cx
+        dy = int(y) - cy
+        if dx or dy:
+            self._send([self._mi(dx, dy, 0, MOUSEEVENTF_MOVE)])   # 相对移动，必发 WM_MOUSEMOVE
+        self._u.SetCursorPos(int(x), int(y))                       # 精确归位，消除加速漂移
 
     def _btn_flags(self, button, down):
         b = (button or 'left').lower()
