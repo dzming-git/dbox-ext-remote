@@ -271,12 +271,16 @@ class InputInjector(object):
         return nx, ny
 
     def mouse_move(self, x, y):
-        # SetCursorPos 在 DPI 感知进程接收**物理像素**，且没有 SendInput 绝对坐标的
-        # 65535/虚拟化天花板——1920 缩放下物理 >1536 的右/底区域用 SendInput 绝对坐标
-        # 会按 1/scale 偏移或钳到边界（即「越往右下偏越多」的非固定距离偏差）。故定位只
-        # 用 SetCursorPos（物理坐标直发），按钮事件在 mouse_click/mouse_button 里以
-        # dx=dy=0 的 SendInput 发在当前光标位置，互不干扰。
+        # SetCursorPos 把光标精确移到物理像素位置（无 65535/虚拟化天花板偏移，见上方说明）。
+        # 但 SetCursorPos 不会向目标窗口派发 WM_MOUSEMOVE——画图这类「在 mousemove 上连线」
+        # 的程序只会拿到按下/抬起两个位置，画出来就是一条直线。所以再补一条绝对坐标的
+        # 鼠标移动 INPUT 事件（MOUSEEVENTF_VIRTUALDESK + _abs 物理归一化，全屏精确）来
+        # 真正触发 WM_MOUSEMOVE，使拖拽/手绘能连续落点。
         self._u.SetCursorPos(int(x), int(y))
+        nx, ny = self._abs(int(x), int(y))
+        self._send([self._mi(nx, ny, 0,
+                              MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+                              | MOUSEEVENTF_VIRTUALDESK)])
 
     def _btn_flags(self, button, down):
         b = (button or 'left').lower()
