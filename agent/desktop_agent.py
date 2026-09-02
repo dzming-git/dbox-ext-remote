@@ -164,6 +164,7 @@ MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
 MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_HWHEEL = 0x01000
 KEYEVENTF_KEYUP = 0x0002
@@ -259,15 +260,23 @@ class InputInjector(object):
         无视进程 DPI 感知，恒定映射到虚拟化虚拟屏。screen.width/height 是物理值，
         直接除会按 1/scale 偏移。
         """
-        vw = max(1, int(self.screen.width / self._scale) - 1)
-        vh = max(1, int(self.screen.height / self._scale) - 1)
+        # 配合 MOUSEEVENTF_VIRTUALDESK：绝对坐标映射到整个物理虚拟桌面，归一化
+        # 分母直接用 DPI 感知后的物理尺寸（screen.width/height），无需再除缩放比——
+        # 否则物理坐标 > 虚拟化宽（如 1920 屏下 1690 > 1536）会被 65535 上限钳到边界，
+        # 导致屏幕右下角整块点不到（表现为「越往右下偏越多」的非固定距离偏差）。
+        vw = max(1, self.screen.width - 1)
+        vh = max(1, self.screen.height - 1)
         nx = int(max(0, min(65535, x * 65535 // vw)))
         ny = int(max(0, min(65535, y * 65535 // vh)))
         return nx, ny
 
     def mouse_move(self, x, y):
-        nx, ny = self._abs(x, y)
-        self._send([self._mi(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)])
+        # SetCursorPos 在 DPI 感知进程接收**物理像素**，且没有 SendInput 绝对坐标的
+        # 65535/虚拟化天花板——1920 缩放下物理 >1536 的右/底区域用 SendInput 绝对坐标
+        # 会按 1/scale 偏移或钳到边界（即「越往右下偏越多」的非固定距离偏差）。故定位只
+        # 用 SetCursorPos（物理坐标直发），按钮事件在 mouse_click/mouse_button 里以
+        # dx=dy=0 的 SendInput 发在当前光标位置，互不干扰。
+        self._u.SetCursorPos(int(x), int(y))
 
     def _btn_flags(self, button, down):
         b = (button or 'left').lower()
@@ -522,6 +531,14 @@ class Handler(BaseHTTPRequestHandler):
                 'uptime': round(time.time() - _STATE.started_at, 1),
             })
             return
+        if path == '/cursor':
+            try:
+                import win32gui
+                x, y = win32gui.GetCursorPos()
+                self._json({'ok': True, 'x': x, 'y': y})
+            except Exception as e:
+                self._json({'ok': False, 'err': str(e)})
+            return
         if path == '/diag':
             info = {
                 'ok': True, 'pid': os.getpid(),
@@ -534,6 +551,18 @@ class Handler(BaseHTTPRequestHandler):
                 info['session'] = win32ts.ProcessIdToSessionId(os.getpid())
             except Exception:
                 info['session'] = '?'
+            # 标定 SetCursorPos 的坐标系：发若干坐标，读回 GetCursorPos（无外部干扰）
+            try:
+                import win32gui, time as _t, ctypes as _ct
+                u = _ct.windll.user32
+                probes = []
+                for (sx, sy) in [(500, 300), (1000, 540), (1536, 864), (1920, 1080)]:
+                    u.SetCursorPos(int(sx), int(sy))
+                    _t.sleep(0.12)
+                    probes.append({'set': [sx, sy], 'got': list(win32gui.GetCursorPos())})
+                info['cursorprobe'] = probes
+            except Exception as e:
+                info['cursorprobe_err'] = str(e)
             # 实测一次 SendInput：移到鼠标**当前**位置，不改变任何东西，只为取返回值
             try:
                 import win32gui
