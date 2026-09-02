@@ -116,7 +116,10 @@
 <script>
 (function () {
   'use strict';
-  var API = (location.pathname.replace(/\/+$/, '') || '') + '/api/ext/remote';
+  // 必须是**绝对路径**：面板跑在 about:srcdoc 的 iframe 里，location.pathname 是
+  // "about:srcdoc" 而不是 dbox 的路径，拿它拼前缀会拼出 about:srcdoc/api/... 直接发不出去
+  //（表现为「服务不可达」）。全屏页 /ext/remote 下同样适用——API 前缀与页面路径无关。
+  var API = '/api/ext/remote';
   var $ = function (id) { return document.getElementById(id); };
 
   // ---- token：优先读宿主写进 localStorage 的最新 token ----
