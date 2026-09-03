@@ -352,6 +352,7 @@ def create_blueprint(host):
 
         def gen():
             miss = 0
+            first = True
             try:
                 while True:
                     # 活跃窗口内：强制推帧（still_thr=0），保证画图/拖拽实时可见
@@ -363,6 +364,11 @@ def create_blueprint(host):
                              'gray=%s' % ('1' if gray else '0'),
                              'cursor=%s' % ('1' if cursor else '0'),
                              'delta=1']
+                    if first:
+                        # 新流首拍强制关键帧：否则重连时若屏幕静止，首拍会判空而整拍跳过，
+                        # 前端永远等不到首帧、卡在「正在连接」。收过首帧后即恢复差分。
+                        parts.append('kf=1')
+                        first = False
                     if active:
                         parts.append('still_thr=0')
                     if rect:
@@ -370,7 +376,11 @@ def create_blueprint(host):
                         parts.append('ry=%d' % rect[1])
                         parts.append('rw=%d' % rect[2])
                         parts.append('rh=%d' % rect[3])
-                        req = urllib.request.Request(_agent_url('/frame?' + '&'.join(parts)))
+                    # 整帧请求必须无条件发出：ROI 只是附加 rx/ry/rw/rh 参数，不能把请求
+                    # 关在 if rect 里——否则默认（非 ROI）模式下整帧请求被跳过，前端永远
+                    # 等不到首帧、卡在「正在连接」。
+                    req = urllib.request.Request(_agent_url('/frame?' + '&'.join(parts)))
+                    try:
                         with urllib.request.urlopen(req, timeout=max(2.0, interval * 3)) as resp:
                             if resp.headers.get('X-Frame-Empty') == '1':
                                 miss = 0

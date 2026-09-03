@@ -655,7 +655,7 @@ def winstation_info():
 
 
 def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, rect=None,
-                 delta=False, th=DIFF_THRESHOLD):
+                 delta=False, th=DIFF_THRESHOLD, kf_force=False):
     # rect 非 None 时只抓/只编码这一块；rect 同时作为差分模式补丁的「绝对坐标基准」。
     _STATE.screen.cursor_on = cursor
     img = _STATE.screen.grab(rect)                 # 捕获分辨率 RGB（ROI 时为该区域）
@@ -664,7 +664,9 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, r
         rk = tuple(rect) if rect else None
         prev = _last.get('img')
         same_region = (_last.get('rect') == rk)
-        need_kf = (prev is None or not same_region
+        # kf_force：后端在一条新流的首拍强制关键帧，否则重连时屏幕静止会一直返回空帧、
+        # 前端永远等不到首帧而卡在「正在连接」。
+        need_kf = (kf_force or prev is None or not same_region
                    or _last.get('kf', 0) >= KF_INTERVAL)
         if need_kf:
             # 关键帧强制原生分辨率，确保前端画布锁定整屏虚拟分辨率、补丁坐标对齐
@@ -832,6 +834,7 @@ class Handler(BaseHTTPRequestHandler):
                 still_thr = float(qs.get('still_thr', STILL_THRESHOLD))
                 delta = str(qs.get('delta', '0')) in ('1', 'true', 'yes')
                 th = float(qs.get('th', DIFF_THRESHOLD))
+                kf_force = str(qs.get('kf', '0')) in ('1', 'true', 'yes')
             except Exception:
                 scale, quality, gray, cursor, still_thr, delta, th = (
                     1.0, 60, False, True, STILL_THRESHOLD, False, DIFF_THRESHOLD)
@@ -842,7 +845,7 @@ class Handler(BaseHTTPRequestHandler):
             rect = parse_rect(qs, _STATE.screen)
             try:
                 res = encode_frame(scale, quality, gray, still_thr, cursor, rect,
-                                   delta=delta, th=th)
+                                   delta=delta, th=th, kf_force=kf_force)
             except Exception as e:
                 self._json({'ok': False, 'error': 'grab failed: %s' % e}, 500)
                 return
