@@ -177,7 +177,9 @@
   // 必须是**绝对路径**：面板跑在 about:srcdoc 的 iframe 里，location.pathname 是
   // "about:srcdoc" 而不是 dbox 的路径，拿它拼前缀会拼出 about:srcdoc/api/... 直接发不出去
   //（表现为「服务不可达」）。全屏页 /ext/remote 下同样适用——API 前缀与页面路径无关。
-  var API = '/api/ext/remote';
+  // 平台注入真实 API 前缀：框架 serve 面板时把 __EXT_API_PREFIX__ 替换为 /api/ext/<key>/。
+  // 去掉末尾斜杠以兼容下方 API + '/xxx' 拼接；前缀不再硬编码，平台改规则只改一处。
+  var API = '__EXT_API_PREFIX__'.replace(/\/$/, '');
   var $ = function (id) { return document.getElementById(id); };
   // 服务端返回的错误信息可能含系统输出，一律转义后再塞进 innerHTML
   function esc(s) {
