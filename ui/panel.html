@@ -148,6 +148,7 @@
     <label>分辨率 <input type="range" id="a-scale" min="30" max="100" step="10" value="100" /><span class="v" id="v-scale">100%</span></label>
     <label><input type="checkbox" id="a-gray" /> 灰度</label>
     <label><input type="checkbox" id="a-still" checked /> 静止不推帧</label>
+    <label><input type="checkbox" id="a-delta" checked /> 差分传输(P帧)</label>
     <button id="btn-apply">应用</button>
     <button id="btn-reset">跟随档位</button>
   </div>
@@ -225,9 +226,9 @@
 
   // ---- 状态 ----
   var BASE_PRESETS = {   // 永不随服务端 presets 响应被覆盖的基准，切换/重置兜底用
-    smooth:   { fps: 15, q: 72, scale: 100, gray: false, still: false, cursor: true },
-    balanced: { fps: 8,  q: 60, scale: 100, gray: false, still: true,  cursor: true },
-    saver:    { fps: 3,  q: 42, scale: 70,  gray: false, still: true,  cursor: true },
+    smooth:   { fps: 15, q: 72, scale: 100, gray: false, still: false, cursor: true, delta: true },
+    balanced: { fps: 8,  q: 60, scale: 100, gray: false, still: true,  cursor: true, delta: true },
+    saver:    { fps: 3,  q: 42, scale: 70,  gray: false, still: true,  cursor: true, delta: true },
   };
   var PRESETS = Object.assign({}, BASE_PRESETS);   // 可被服务端 d.presets 局部覆盖，但三档基准始终在
   var cfg = Object.assign({}, BASE_PRESETS.balanced);
@@ -324,6 +325,7 @@
     return API + '/stream?token=' + encodeURIComponent(token())
       + '&fps=' + cfg.fps + '&q=' + cfg.q + '&scale=' + (cfg.scale / 100)
       + '&gray=' + (cfg.gray ? 1 : 0) + '&still=' + (cfg.still ? 1 : 0)
+      + '&delta=' + (cfg.delta ? 1 : 0)
       + '&cursor=' + (cfg.cursor ? 1 : 0)
       + '&_t=' + Date.now();
   }
@@ -1141,11 +1143,12 @@
     $('a-scale').value = cfg.scale; $('v-scale').textContent = cfg.scale + '%';
     $('a-gray').checked = !!cfg.gray;
     $('a-still').checked = !!cfg.still;
+    $('a-delta').checked = !!cfg.delta;
   }
   function readAdv() {
     cfg.fps = +$('a-fps').value; cfg.q = +$('a-q').value;
     cfg.scale = +$('a-scale').value; cfg.gray = $('a-gray').checked;
-    cfg.still = $('a-still').checked;
+    cfg.still = $('a-still').checked; cfg.delta = $('a-delta').checked;
   }
   $('btn-adv').addEventListener('click', function () {
     var p = $('adv');
@@ -1175,6 +1178,7 @@
     if (cfg.scale < 100) bits.push('分辨率 ' + cfg.scale + '%');
     if (cfg.gray) bits.push('灰度');
     if (cfg.still) bits.push('静止不推帧');
+    if (cfg.delta) bits.push('差分');
     bits.push('缩放 ' + Math.round(zoom * 100) + '%');
     if (sentRoi) bits.push('区域 ' + sentRoi.w + '×' + sentRoi.h);   // 生效中的 ROI，便于核对省流量是否真的在工作
     if (stat.fps || stat.kbps) bits.push('实测 ' + stat.fps + 'fps · ' + stat.kbps + ' KB/s');
@@ -1265,7 +1269,7 @@
         screenW = sw; screenH = sh;
         hideOverlay();
         if (d.presets) PRESETS = Object.assign({}, PRESETS, d.presets);   // 合并不整体替换，保留三档基准
-        var key = [cfg.fps, cfg.q, cfg.scale, cfg.gray, cfg.still].join('|');
+        var key = [cfg.fps, cfg.q, cfg.scale, cfg.gray, cfg.still, cfg.delta].join('|');
         // 只在「首次连上」「分辨率变了」「档位变了」时重建流——
         // 否则轮询会不停打断正在看的画面
         if (changed || key !== lastStreamKey) {

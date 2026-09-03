@@ -351,58 +351,47 @@ def create_blueprint(host):
         interval = 1.0 / max(0.5, fps)
 
         def gen():
-            last_hash = None
             miss = 0
             try:
                 while True:
-                    # 活跃窗口内：强制推帧，且让代理跳过静止检测（still_thr=0），
-                    # 这样画图/拖拽时即使只是细线变化也能实时刷新，不必切走再切回。
+                    # 活跃窗口内：强制推帧（still_thr=0），保证画图/拖拽实时可见
                     active = (time.time() - _last_input_ts) < ACTIVE_WINDOW
                     rect = _viewports.get(uid)          # 用户当前视口（ROI），可能为 None
-                    data = None
-                    fhash = 'offline'
-                    frect = None
-                    try:
-                        # ROI 模式强制原生分辨率：区域本来就小，再降采样只会白白变糊，
-                        # 而省下的面积早已远超降分辨率那点收益。
-                        agent_scale = 1.0 if rect else scale
-                        parts = ['scale=%.3f' % agent_scale, 'q=%d' % quality,
-                                 'gray=%s' % ('1' if gray else '0'),
-                                 'cursor=%s' % ('1' if cursor else '0')]
-                        if active:
-                            parts.append('still_thr=0')
-                        if rect:
-                            parts.append('rx=%d' % rect[0])
-                            parts.append('ry=%d' % rect[1])
-                            parts.append('rw=%d' % rect[2])
-                            parts.append('rh=%d' % rect[3])
-                        q = '/frame?' + '&'.join(parts)
-                        body, headers, _ = _agent_get(q, timeout=max(2.0, interval * 3))
-                        data = body
-                        fhash = headers.get('X-Frame-Hash') or 'f%d' % time.time()
-                        frect = _parse_agent_rect(headers.get('X-Frame-Rect'))
-                        miss = 0
+                    # ROI 模式强制原生分辨率：区域本来就小，再降采样只会白白变糊
+                    agent_scale = 1.0 if rect else scale
+                    parts = ['scale=%.3f' % agent_scale, 'q=%d' % quality,
+                             'gray=%s' % ('1' if gray else '0'),
+                             'cursor=%s' % ('1' if cursor else '0'),
+                             'delta=1']
+                    if active:
+                        parts.append('still_thr=0')
+                    if rect:
+                        parts.append('rx=%d' % rect[0])
+                        parts.append('ry=%d' % rect[1])
+                        parts.append('rw=%d' % rect[2])
+                        parts.append('rh=%d' % rect[3])
+                        req = urllib.request.Request(_agent_url('/frame?' + '&'.join(parts)))
+                        with urllib.request.urlopen(req, timeout=max(2.0, interval * 3)) as resp:
+                            if resp.headers.get('X-Frame-Empty') == '1':
+                                miss = 0
+                                time.sleep(interval)
+                                continue
+                            data = resp.read()
+                            miss = 0
                     except Exception:
                         miss += 1
                         # 连续失败才降级为占位帧：偶发单帧抓取失败不该让用户看到闪烁
                         if miss >= 3:
-                            data = _placeholder_jpeg()
-                            fhash = 'offline'
-                    if data:
-                        if skip_still and not active and fhash == last_hash:
+                            ph = _placeholder_jpeg()
+                            data = (b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                                    + str(len(ph)).encode() + b'\r\n\r\n' + ph + b'\r\n')
+                        else:
                             time.sleep(interval)
                             continue
-                        last_hash = fhash
-                        head = (b'--frame\r\n'
-                                b'Content-Type: image/jpeg\r\n')
-                        if frect:
-                            # 以代理**实际服务**的区域为准（可能被夹取过），前端按它定位补丁
-                            head += b'X-Frame-Rect: %d,%d,%d,%d\r\n' % frect
-                        head += (b'Content-Length: ' + str(len(data)).encode() +
-                                 b'\r\n\r\n' + data + b'\r\n')
-                        yield head
+                    if data:
+                        yield data
                     # 掉线时把节奏放慢，别空转烧 CPU，也别用占位帧刷流量
-                    time.sleep(interval if fhash != 'offline' else 1.0)
+                    time.sleep(interval if miss == 0 else 1.0)
             except GeneratorExit:
                 return
 

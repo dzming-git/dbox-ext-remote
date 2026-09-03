@@ -506,7 +506,16 @@ _STATE = None
 # 这些微小变化会让「静止不推帧」永远不生效，省流量档位就只剩降帧率和降画质可用。
 STILL_THRESHOLD = 2.5          # 0-255 的平均差异，低于此即视为画面没动
 _SIG_W, _SIG_H = 64, 36
-_last = {'data': None, 'hash': None, 'sig': None, 'key': None}
+# ---- 差分传输（I/P 帧式脏矩形）----
+# delta 模式下 agent 常驻上一帧捕获图，逐 tile 比对找出变化矩形，只把变化的小块作为补丁
+# （带 X-Frame-Rect 绝对坐标）发出；每隔 KF_INTERVAL 拍强制发一次整帧关键帧，防止前端画布
+# （P 帧累积）漂移。光标每帧重绘，移动时自然产生「旧位置+新位置」两个脏矩形，等价于 VNC 的
+# 光标独立编码，无需额外处理。关键帧强制原生分辨率，确保前端画布锁定为整屏虚拟分辨率、补丁坐标对齐。
+TILE = 32                      # 脏矩形检测块大小（像素）
+DIFF_THRESHOLD = 12            # 单像素灰度差超过此值即认为该块变化（0-255）
+KF_INTERVAL = 45               # 每隔多少拍发一次整帧关键帧（≈8fps 下约 5.6s）
+_last = {'data': None, 'hash': None, 'sig': None, 'key': None,
+         'img': None, 'rect': None, 'kf': 0}
 
 
 def _signature(img):
@@ -524,6 +533,75 @@ def _is_still(sig, threshold):
         return (total / float(_SIG_W * _SIG_H)) < threshold
     except Exception:
         return False
+
+
+def _diff_dirty_rects(cur, prev, th, tile):
+    """逐 tile 比对两帧，返回变化矩形的像素坐标列表 [(x,y,w,h), ...]（捕获分辨率）。
+
+    光标/插入符等小变化只命中少数 tile，据此只回传那几块，静态区域零流量。
+    """
+    from PIL import ImageChops
+    W, H = cur.size
+    cols = (W + tile - 1) // tile
+    rows = (H + tile - 1) // tile
+    dirty = [[False] * cols for _ in range(rows)]
+    for ty in range(rows):
+        y0 = ty * tile
+        y1 = min(H, y0 + tile)
+        for tx in range(cols):
+            x0 = tx * tile
+            x1 = min(W, x0 + tile)
+            d = ImageChops.difference(cur.crop((x0, y0, x1, y1)),
+                                      prev.crop((x0, y0, x1, y1)))
+            try:
+                mx = d.convert('L').getextrema()[1]
+            except Exception:
+                mx = 255
+            if mx > th:
+                dirty[ty][tx] = True
+    # 先按行合并成水平条带，再把竖直相邻且同 x 范围的条带合并，得到少量矩形
+    strips = []
+    for ty in range(rows):
+        tx = 0
+        while tx < cols:
+            if not dirty[ty][tx]:
+                tx += 1
+                continue
+            x0 = tx
+            while tx < cols and dirty[ty][tx]:
+                tx += 1
+            px0 = x0 * tile
+            px1 = min(W, tx * tile)
+            py0 = ty * tile
+            py1 = min(H, (ty + 1) * tile)
+            strips.append([px0, py0, px1, py1])
+    strips.sort(key=lambda s: (s[1], s[0], s[2]))
+    merged = []
+    for s in strips:
+        if (merged and merged[-1][1] + (merged[-1][3] - merged[-1][1]) == s[1]
+                and merged[-1][0] == s[0] and merged[-1][2] == s[2]):
+            merged[-1][3] = s[3]
+        else:
+            merged.append(s[:])
+    return [(m[0], m[1], m[2] - m[0], m[3] - m[1]) for m in merged]
+
+
+def _multipart(parts):
+    """parts: [(jpeg_bytes, rect_or_None), ...] → 不带结束边界的 multipart 字节流。
+
+    复用前端已支持的 boundary=frame 与 X-Frame-Rect 补丁合成机制（前端把每块贴到画布
+    对应绝对坐标）。不写结束边界，便于后端按拍把多拍的部件拼成一个连续流。
+    """
+    out = bytearray()
+    for data, rk in parts:
+        out += b'--frame\r\n'
+        out += b'Content-Type: image/jpeg\r\n'
+        if rk:
+            out += b'X-Frame-Rect: %d,%d,%d,%d\r\n' % (rk[0], rk[1], rk[2], rk[3])
+        out += b'Content-Length: ' + str(len(data)).encode() + b'\r\n\r\n'
+        out += data
+        out += b'\r\n'
+    return bytes(out)
 
 
 def integrity_level():
@@ -576,19 +654,55 @@ def winstation_info():
         return {'err': str(e)}
 
 
-def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, rect=None):
-    # rect 非 None 时只抓/只编码这一块：指纹也随之只覆盖该区域，
-    # 静止检测天然变成「只检测这个区域的变化」，无需改动 _is_still。
+def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, rect=None,
+                 delta=False, th=DIFF_THRESHOLD):
+    # rect 非 None 时只抓/只编码这一块；rect 同时作为差分模式补丁的「绝对坐标基准」。
     _STATE.screen.cursor_on = cursor
-    img = _STATE.screen.grab(rect)
+    img = _STATE.screen.grab(rect)                 # 捕获分辨率 RGB（ROI 时为该区域）
+    # 差分模式：与上一帧比对，只发变化矩形（P 帧）+ 周期关键帧（I 帧）
+    if delta:
+        rk = tuple(rect) if rect else None
+        prev = _last.get('img')
+        same_region = (_last.get('rect') == rk)
+        need_kf = (prev is None or not same_region
+                   or _last.get('kf', 0) >= KF_INTERVAL)
+        if need_kf:
+            # 关键帧强制原生分辨率，确保前端画布锁定整屏虚拟分辨率、补丁坐标对齐
+            data = _encode_jpeg(img, 1.0, quality, gray)
+            _last.update({'img': img, 'rect': rk, 'kf': 0})
+            return ('kf', data, rk)                 # 整帧关键帧；前端按 rk 贴（None=整屏）
+        rects = _diff_dirty_rects(img, prev, th, TILE)
+        if not rects:
+            _last['kf'] = _last.get('kf', 0) + 1
+            return ('empty',)                       # 完全没变：后端据此整拍跳过，零流量
+        parts = []
+        ox, oy = (rect[0], rect[1]) if rect else (0, 0)   # ROI 局部坐标 → 虚拟屏绝对坐标
+        sc = max(0.2, min(1.0, scale))
+        for (lx, ly, lw, lh) in rects:
+            crop = img.crop((lx, ly, lx + lw, ly + lh))
+            if sc < 0.999:
+                crop = crop.resize((max(1, int(lw * sc)), max(1, int(lh * sc))), 3)
+            if gray:
+                crop = crop.convert('L')
+            buf = io.BytesIO()
+            crop.save(buf, 'JPEG', quality=int(quality), optimize=False)
+            parts.append((buf.getvalue(), (ox + lx, oy + ly, lw, lh)))
+        _last.update({'img': img, 'rect': rk, 'kf': _last.get('kf', 0) + 1})
+        return ('patch', parts)
+    # ---- 传统整帧模式（兼容 / 调试用）----
     sig = _signature(img)
     rk = tuple(rect) if rect else None
-    # 缓存 key 必须带上 rect：否则 ROI 移动后会拿旧区域的帧冒充新区域
     key = (round(scale, 3), int(quality), bool(gray), bool(cursor), rk)
-    # 画面没动且参数没变 → 复用上一帧，连 JPEG 编码都省掉；
-    # hash 不变，后端据此跳过推帧（省掉这一帧的全部流量）
     if _last['data'] is not None and _last['key'] == key and _is_still(sig, still_thr):
         return _last['data'], _last['hash'], rk
+    data = _encode_jpeg(img, scale, quality, gray)
+    h = hashlib.md5(data).hexdigest()
+    _last.update({'data': data, 'hash': h, 'sig': sig, 'key': key})
+    return data, h, rk
+
+
+def _encode_jpeg(img, scale, quality, gray):
+    """整帧编码（带降采样/灰度），差分关键帧与传统整帧模式共用。"""
     if gray:
         img = img.convert('L')            # 单通道 JPEG：比转 RGB 再存省约三成
     if scale and scale < 0.999:
@@ -597,10 +711,7 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, r
         img = img.resize((w, h), 3)       # 3 = Image.LANCZOS
     buf = io.BytesIO()
     img.save(buf, 'JPEG', quality=int(quality), optimize=False)
-    data = buf.getvalue()
-    h = hashlib.md5(data).hexdigest()
-    _last.update({'data': data, 'hash': h, 'sig': sig, 'key': key})
-    return data, h, rk
+    return buf.getvalue()
 
 
 def parse_rect(qs, screen):
@@ -719,27 +830,50 @@ class Handler(BaseHTTPRequestHandler):
                 gray = str(qs.get('gray', '0')) in ('1', 'true', 'yes')
                 cursor = str(qs.get('cursor', '1')) in ('1', 'true', 'yes')
                 still_thr = float(qs.get('still_thr', STILL_THRESHOLD))
+                delta = str(qs.get('delta', '0')) in ('1', 'true', 'yes')
+                th = float(qs.get('th', DIFF_THRESHOLD))
             except Exception:
-                scale, quality, gray, cursor, still_thr = 1.0, 60, False, True, STILL_THRESHOLD
+                scale, quality, gray, cursor, still_thr, delta, th = (
+                    1.0, 60, False, True, STILL_THRESHOLD, False, DIFF_THRESHOLD)
             scale = max(0.2, min(1.0, scale))
             quality = max(10, min(95, quality))
             still_thr = max(0.0, min(64.0, still_thr))
+            th = max(0.0, min(64.0, th))
             rect = parse_rect(qs, _STATE.screen)
             try:
-                data, fhash, srect = encode_frame(scale, quality, gray, still_thr, cursor, rect)
+                res = encode_frame(scale, quality, gray, still_thr, cursor, rect,
+                                   delta=delta, th=th)
             except Exception as e:
                 self._json({'ok': False, 'error': 'grab failed: %s' % e}, 500)
                 return
+            if res[0] == 'empty':
+                # 差分模式且画面完全没变：返回空体，后端据此整拍跳过，零流量
+                self.send_response(200)
+                self.send_header('X-Frame-Empty', '1')
+                self.send_header('Content-Length', '0')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                return
+            if res[0] == 'single':
+                data, fhash, srect = res[1], res[2], res[3]
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('X-Frame-Hash', fhash)
+                if srect:
+                    self.send_header('X-Frame-Rect', '%d,%d,%d,%d' % srect)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            # 差分模式：kf(整帧关键帧) / patch(若干变化补丁) 都已拼成 multipart 字节流
+            body = _multipart([(res[1], res[2])]) if res[0] == 'kf' else _multipart(res[1])
             self.send_response(200)
-            self.send_header('Content-Type', 'image/jpeg')
-            self.send_header('Content-Length', str(len(data)))
-            self.send_header('X-Frame-Hash', fhash)
-            if srect:
-                # 实际服务的区域（可能被夹取过）：客户端必须按这个值定位补丁，不能用自己上报的
-                self.send_header('X-Frame-Rect', '%d,%d,%d,%d' % srect)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
-            self.wfile.write(data)
+            self.wfile.write(body)
             return
         self._json({'ok': False, 'error': 'not found'}, 404)
 
