@@ -5,7 +5,7 @@
   "timeout": 600,
   "enabled": true,
   "backend": {
-    "url_prefix": "/api/ext/remote"
+    "module": "backend.server"
   },
   "ui": {
     "mount": "floating",
