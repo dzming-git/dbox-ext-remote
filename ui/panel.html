@@ -60,12 +60,21 @@
     border-top-color: #1f6feb; border-radius: 50%; animation: sp .8s linear infinite; }
   @keyframes sp { to { transform: rotate(360deg); } }
 
-  /* ---- 底部状态 ---- */
-  .foot { flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
-    padding: 5px 10px; background: #161b22; border-top: 1px solid #262d38;
+  /* ---- 底部状态 ----
+     拆成两行：① 动态信息行（meta+警告）② 静态提示行（tip）。
+     旧实现所有内容挤在一个 nowrap 的 flex 行里：meta 每秒都在变长
+     （追加「实测 Xfps · Y KB/s」「区域 WxH」）、warn 还时有时无 → 抢给 tip 的宽度
+     每变一次，tip 就重新折行、行数在 4↔5 之间跳，整条信息栏高度跟着闪。
+     现在 tip 独占整行宽度 → 折行数只取决于自身固定文案，恒定不闪；
+     meta 行 nowrap + 省略号，永不换行，高度也恒定。 */
+  .foot { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch;
+    gap: 3px; padding: 5px 10px; background: #161b22; border-top: 1px solid #262d38;
     font-size: 11.5px; color: #6e7681; }
-  .foot .warn { color: #d29922; }
-  .foot .sp { flex: 1; }
+  .foot-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  #f-meta { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  .foot .warn { color: #d29922; flex: 0 0 auto; }
+  .foot-tip { line-height: 1.45; }
   /* 软键盘输入框：必须**留在视口内**（不能 left:-9999px 移出屏幕），否则 webview 不弹键盘。
      opacity:0 隐形；font-size:16px 避免 iOS 聚焦自动放大；caret-color:transparent 隐藏光标。
      关键：保持在正常流、紧随 #app 之后、高度仅 1px——focus 时 #kb 落在 #app 正下方(=可视高顶部)，
@@ -164,10 +173,11 @@
   </div>
 
   <div class="foot">
-    <span id="f-meta">—</span>
-    <span class="sp"></span>
-    <span class="warn" id="f-warn"></span>
-    <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移 · 触屏：单指滑＝平移视角，轻点＝左键，长按＝右键，双指捏合＝缩放/平移</span>
+    <div class="foot-row">
+      <span id="f-meta">—</span>
+      <span class="warn" id="f-warn"></span>
+    </div>
+    <div class="foot-tip" id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移 · 触屏：单指滑＝平移视角，轻点＝左键，长按＝右键，双指捏合＝缩放/平移</div>
   </div>
 </div>
 <textarea id="kb" autocomplete="off" spellcheck="false"></textarea>
@@ -535,6 +545,20 @@
       body: JSON.stringify(r ? { x: r.x, y: r.y, w: r.w, h: r.h } : { none: true }),
     }).catch(function () {});
   }
+  function pushCfg() {
+    // 热更新画质参数（分辨率/质量/fps/灰度/静止/光标），不重建流：后端下一拍检测到
+    // scale/ROI 变化会强制关键帧重建画布，避免「改缩放→重建流→断流黑框」。
+    api('/cfg', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scale: cfg.scale, q: cfg.q, fps: cfg.fps,
+        gray: cfg.gray, cursor: cfg.cursor, still: cfg.still, delta: cfg.delta
+      })
+    }).catch(function () {});
+  }
+  var cfgPushT = null;
+  function scheduleCfgPush() { clearTimeout(cfgPushT); cfgPushT = setTimeout(pushCfg, 200); }
   function scheduleRoi() { clearTimeout(roiT); roiT = setTimeout(reportRoi, 120); }
   // 锚点缩放：缩放时保持客户端锚点 (ax,ay) 下的内容不动（默认视口中心）。
   // 双指捏合传「初始双指中点」做锚点，缩放即围绕该点、跟手不漂移。
@@ -817,15 +841,20 @@
   //   #app 保持全高(fullH)再 translateY(−kbH)，露出完整键盘上方区域（工具条+画布都在）。fit 态 resizes-content 已天然生效，不干预。
   // 注意：截图铁证 visualViewport.scrollTop 始终 NaN、window.scrollY 始终 0，绝不能用页面级滚动。
   var app = document.getElementById('app');
-  var fullH = window.innerHeight;          // 键盘收起时全高，用于算真·键盘高（ih 与 vh 弹起后恒等，不能用 ih−vh）
+  // 用 visualViewport 取初始全高（iframe 内 window.innerHeight 可能因父容器而异，
+  //   visualViewport 始终反映真实可视区域；若无 vv 则退回 innerHeight）。
+  var _initVV = window.visualViewport;
+  var fullH = (_initVV ? _initVV.height : window.innerHeight) || window.innerHeight;
   var kbLifted = false;
   var kbDismissT = null;   // 系统「收起键盘」的延迟确认（见 syncKb 收起分支）
   // 两个跨周期记忆值（持久化到 localStorage，硬刷新/重开仍有效）：
   //   kbK       ：键盘本体高（候选栏未现时），= 键盘周期内见到的最小遮挡（候选栏只增不减）
   //   kbMaxEver ：键盘+候选栏的历史最大遮挡（候选栏出现时会变大）
-  // 上移量 = max(当前遮挡, kbMaxEver)；两者都还没学过时，用「键盘高 + 候选栏估计」预抬，避免首轮打字二次上移。
-  // 关键：候选栏高度无法在它出现前得知，故首轮用估计值预抬；真正出现后学会 kbMaxEver，之后每次开键盘直接预抬到含候选栏 → 打字零位移。
+  // 上移量以实测 kbH 为主、kbMaxEver 仅作参考上限（不再无条件钉死）。
+  // 关键修复：kbMaxEver 不再单调递增——若连续多次实际 kbH 远小于它则自动衰减，
+  //   避免某次候选栏弹出记下大值后永久导致过度上移。
   var kbK = 0, kbMaxEver = 0;
+  var _kbSmallCount = 0;   // 连续"kbH 明显小于 kbMaxEver"的次数，达到阈值后衰减 kbMaxEver
   function loadKb() {
     try {
       var a = parseInt(localStorage.getItem('remote_kbK') || '0', 10); if (a > 0) kbK = a;
@@ -868,10 +897,31 @@
     var kbH = fullH - visH;
     if (kbH > 20) {                         // 键盘弹起
       clearTimeout(kbDismissT);             // 键盘在台上：撤销待执行的失焦，避免打字中被误关
-      if (kbH > kbMaxEver) { kbMaxEver = kbH; saveKb(); }
+      if (kbH > kbMaxEver) { kbMaxEver = kbH; _kbSmallCount = 0; saveKb(); }
+      // kbMaxEver 衰减：若实际 kbH 持续明显小于历史最大值（差 > 60px），说明之前的大值是
+      // 候选栏等临时因素造成的，不应永久钉死。连续 3 次后把 kbMaxEver 降到当前 kbH。
+      else if (kbMaxEver - kbH > 60) {
+        _kbSmallCount++;
+        if (_kbSmallCount >= 3) { kbMaxEver = kbH; _kbSmallCount = 0; saveKb(); }
+      } else {
+        _kbSmallCount = 0;
+      }
       if (kbK <= 0 || kbH < kbK) { kbK = kbK <= 0 ? kbH : Math.min(kbK, kbH); saveKb(); }  // 记录键盘本体高（取最小）
+      // lift 以实测 kbH 为主；kbMaxEver 只在"接近实测值"时才用作微调上限（防候选栏闪烁）；
+      // 不再无条件取 max(kbH, kbMaxEver, kbH+est)，避免历史大值或估计值导致过度上移。
       var est = Math.max(36, Math.min(120, Math.round((kbK || kbH) * 0.12)));
-      var lift = Math.max(kbH, kbMaxEver, (kbK || kbH) + est);   // 始终含「键盘高+候选栏估计」预抬量 → 单调不回落、打字零位移
+      var candidateLift = (kbK || kbH) + est;   // 首轮无历史数据时的保守估计
+      var lift = kbH;                            // 默认用实测值
+      if (kbMaxEver > 0 && kbMaxEver <= kbH + 80) {
+        // kbMaxEver 在合理范围内（比实测高不超过 80px），用它确保候选栏出现时不二次上移
+        lift = Math.max(lift, kbMaxEver);
+      } else if (!kbK && kbMaxEver === 0) {
+        // 从未学过任何值，用首轮估计避免首次打字时的二次跳动
+        lift = Math.max(lift, candidateLift);
+      }
+      // 合理性硬上限：键盘不可能超过全高的 65%（任何设备的软键盘都不超过此比例）
+      var maxLift = Math.round(fullH * 0.65);
+      if (lift > maxLift) { lift = maxLift; }
       applyKbLift(lift);
       kbLifted = true;
       kbEvt = 'up h=' + Math.round(kbH) + ' lift=' + Math.round(lift);
@@ -1156,10 +1206,10 @@
     p.style.display = show ? '' : 'none';
     this.classList.toggle('on', show);
   });
-  $('a-fps').addEventListener('input', function () { $('v-fps').textContent = this.value; });
-  $('a-q').addEventListener('input', function () { $('v-q').textContent = this.value; });
-  $('a-scale').addEventListener('input', function () { $('v-scale').textContent = this.value + '%'; });
-  $('btn-apply').addEventListener('click', function () { readAdv(); startStream(); updateMeta(); writePrefs(); });
+  $('a-fps').addEventListener('input', function () { cfg.fps = +this.value; $('v-fps').textContent = this.value; scheduleCfgPush(); });
+  $('a-q').addEventListener('input', function () { cfg.q = +this.value; $('v-q').textContent = this.value; scheduleCfgPush(); });
+  $('a-scale').addEventListener('input', function () { cfg.scale = +this.value; $('v-scale').textContent = this.value + '%'; scheduleCfgPush(); });
+  $('btn-apply').addEventListener('click', function () { readAdv(); pushCfg(); updateMeta(); writePrefs(); });
   $('btn-reset').addEventListener('click', function () {
     cfg = Object.assign({}, PRESETS[presetName] || BASE_PRESETS[presetName] || BASE_PRESETS.balanced);
     fillAdv(); startStream(); updateMeta(); writePrefs();
