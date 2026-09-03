@@ -64,7 +64,17 @@ class ScreenCapture(object):
         self._win32ui = win32ui
         self._lock = threading.Lock()
         self._dcs = None
+        self.cursor_on = True
         self._setup(win32api, win32gui, win32ui)
+        # GDI 专属抓屏线程：HTTP 每请求一个线程，而 win32ui 的 DC/位图对象**绑在创建它的线程上**，
+        # 跨线程复用会直接 BitBlt failed（实测：A 线程建的 DC，B 线程用必挂）。
+        # 故所有 GDI 调用都收敛到这一个线程里做，DC 在哪建就在哪用，彻底规避线程亲和问题。
+        # 顺带修掉一个既有隐患：分辨率变化时 refresh_if_changed→_setup 会在请求线程重建整屏 DC，
+        # 之后其它线程的整屏抓取全部永久失败（远程画面就此卡死）。
+        self._jobs = __import__('queue').Queue()
+        self._worker = threading.Thread(target=self._worker_loop, name='gdi-capture')
+        self._worker.daemon = True
+        self._worker.start()
 
     def _setup(self, win32api, win32gui, win32ui):
         # 虚拟屏（多显示器合并后的整块画布）；单显示器时这几个值与主屏一致
@@ -107,6 +117,87 @@ class ScreenCapture(object):
         except Exception:
             pass
 
+    def _worker_loop(self):
+        """抓屏线程主循环：所有 GDI 调用都在这里发生。"""
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            rect, slot = job
+            try:
+                slot['img'] = self._grab_now(rect)
+            except Exception as e:
+                slot['err'] = e
+            slot['evt'].set()
+
+    def grab(self, rect=None):
+        """取一帧 PIL Image（RGB）。可从任意线程调用，实际 GDI 工作交给抓屏线程。
+
+        rect=(x, y, w, h) 为虚拟屏坐标时只抓这一块（省流量：用户放大看局部时，
+        整屏采集+编码的绝大多数像素都被浪费）。rect 为 None 时整屏。
+        """
+        if threading.current_thread() is self._worker:
+            return self._grab_now(rect)          # 已在抓屏线程：直接做，避免自锁
+        slot = {'evt': threading.Event(), 'img': None, 'err': None}
+        self._jobs.put((rect, slot))
+        if not slot['evt'].wait(15):
+            raise RuntimeError('capture timeout')
+        if slot['err'] is not None:
+            raise slot['err']
+        return slot['img']
+
+    def _grab_now(self, rect=None):
+        """真正的 GDI 抓取，**只允许在 self._worker 线程内调用**。"""
+        from PIL import Image
+        with self._lock:
+            self.refresh_if_changed()
+            if rect is None:
+                # 整屏位图长期复用；若 BitBlt 失败（DC 已失效）就在本线程重建后重试一次。
+                # 重建必须在这里做：在别的线程重建会让这个 DC 对所有其它线程失效。
+                for attempt in (0, 1):
+                    try:
+                        _, srcdc, memdc, bmp = self._dcs
+                        memdc.BitBlt((0, 0), (self.width, self.height),
+                                     srcdc, (self.left, self.top), self.SRCCOPY)
+                        break
+                    except Exception:
+                        if attempt:
+                            raise
+                        self._setup(self._win32api, self._win32gui, self._win32ui)
+                if self.cursor_on:
+                    self._draw_cursor(memdc)
+                bits = bmp.GetBitmapBits(True)
+                w, h = self.width, self.height
+            else:
+                rx, ry, rw, rh = rect
+                srcdc = self._dcs[1]
+                # ROI 每次现建现用：不能复用整屏位图（GetBitmapBits 会把整块 8MB 全拷出来，
+                # 只抓一小块时这个拷贝才是主要开销），而 ROI 尺寸随视口频繁变化、缓存收益有限，
+                # 现建现用还顺带彻底避开「跨线程复用 DC」这一整类问题。
+                memdc = srcdc.CreateCompatibleDC()
+                bmp = self._win32ui.CreateBitmap()
+                try:
+                    bmp.CreateCompatibleBitmap(srcdc, rw, rh)
+                    memdc.SelectObject(bmp)
+                    memdc.BitBlt((0, 0), (rw, rh), srcdc,
+                                 (self.left + rx, self.top + ry), self.SRCCOPY)
+                    if self.cursor_on:
+                        # 指针是屏幕坐标，抓子区域时要减掉区域原点才是位图内坐标
+                        self._draw_cursor(memdc, offset=(-rx, -ry), size=(rw, rh))
+                    bits = bmp.GetBitmapBits(True)
+                finally:
+                    try:
+                        self._win32gui.DeleteObject(bmp.GetHandle())
+                    except Exception:
+                        pass
+                    try:
+                        memdc.DeleteDC()
+                    except Exception:
+                        pass
+                w, h = rw, rh
+        # frombuffer 是零拷贝视图，必须 copy 后才能安全复用底层 DC
+        return Image.frombuffer('RGB', (w, h), bits, 'raw', 'BGRX', 0, 1).copy()
+
     def refresh_if_changed(self):
         """分辨率/显示器布局变了要重建 DC，否则画面会被裁掉或拉伸。"""
         try:
@@ -119,21 +210,9 @@ class ScreenCapture(object):
             pass
         return False
 
-    def grab(self):
-        """返回 PIL Image（RGB）。"""
-        from PIL import Image
-        with self._lock:
-            self.refresh_if_changed()
-            _, srcdc, memdc, bmp = self._dcs
-            memdc.BitBlt((0, 0), (self.width, self.height),
-                         srcdc, (self.left, self.top), self.SRCCOPY)
-            self._draw_cursor(memdc)
-            bits = bmp.GetBitmapBits(True)
-        # frombuffer 是零拷贝视图，必须 copy 后才能安全复用底层 DC
-        return Image.frombuffer('RGB', (self.width, self.height),
-                                bits, 'raw', 'BGRX', 0, 1).copy()
-
-    def _draw_cursor(self, memdc):
+    def _draw_cursor(self, memdc, offset=(0, 0), size=None):
+        """把指针画进位图。抓 ROI 时 offset=(-rx,-ry)、size=(rw,rh)，
+        指针落在区域外就不画（避免把图标画到错误的相对位置）。"""
         try:
             info = self._win32gui.GetCursorInfo()
             if not info or len(info) < 3:
@@ -142,13 +221,23 @@ class ScreenCapture(object):
             if not (flags & self.CURSOR_SHOWING) or not hcursor:
                 return
             x, y = pos[0] - self.left, pos[1] - self.top
-            if 0 <= x < self.width and 0 <= y < self.height:
-                self._win32gui.DrawIconEx(memdc.GetHandleOutput(), x, y, hcursor,
-                                          0, 0, 0, None, self.DI_NORMAL)
+            if not (0 <= x < self.width and 0 <= y < self.height):
+                return                                  # 指针在虚拟屏外
+            x += offset[0]
+            y += offset[1]
+            w, h = size or (self.width, self.height)
+            if not (0 <= x < w and 0 <= y < h):
+                return                                  # 指针不在本次抓取的区域内
+            self._win32gui.DrawIconEx(memdc.GetHandleOutput(), x, y, hcursor,
+                                      0, 0, 0, None, self.DI_NORMAL)
         except Exception:
             pass
 
     def close(self):
+        try:
+            self._jobs.put(None)          # 通知抓屏线程退出
+        except Exception:
+            pass
         self._release()
 
 
@@ -227,6 +316,7 @@ class InputInjector(object):
         except Exception:
             dpi = 96
         self._scale = max(1.0, dpi / 96.0)
+        self.cursor_on = True          # 是否在抓屏画面里绘制鼠标指针（面板可切换）
 
     def _send(self, items):
         arr = (self.INPUT * len(items))(*items)
@@ -486,14 +576,19 @@ def winstation_info():
         return {'err': str(e)}
 
 
-def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD):
-    img = _STATE.screen.grab()
+def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, rect=None):
+    # rect 非 None 时只抓/只编码这一块：指纹也随之只覆盖该区域，
+    # 静止检测天然变成「只检测这个区域的变化」，无需改动 _is_still。
+    _STATE.screen.cursor_on = cursor
+    img = _STATE.screen.grab(rect)
     sig = _signature(img)
-    key = (round(scale, 3), int(quality), bool(gray))
+    rk = tuple(rect) if rect else None
+    # 缓存 key 必须带上 rect：否则 ROI 移动后会拿旧区域的帧冒充新区域
+    key = (round(scale, 3), int(quality), bool(gray), bool(cursor), rk)
     # 画面没动且参数没变 → 复用上一帧，连 JPEG 编码都省掉；
     # hash 不变，后端据此跳过推帧（省掉这一帧的全部流量）
     if _last['data'] is not None and _last['key'] == key and _is_still(sig, still_thr):
-        return _last['data'], _last['hash']
+        return _last['data'], _last['hash'], rk
     if gray:
         img = img.convert('L')            # 单通道 JPEG：比转 RGB 再存省约三成
     if scale and scale < 0.999:
@@ -505,7 +600,38 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD):
     data = buf.getvalue()
     h = hashlib.md5(data).hexdigest()
     _last.update({'data': data, 'hash': h, 'sig': sig, 'key': key})
-    return data, h
+    return data, h, rk
+
+
+def parse_rect(qs, screen):
+    """解析 ROI 矩形（虚拟屏坐标）。
+
+    缺参 / 非法 / 几乎覆盖全屏 → 返回 None（退化为原来的整帧路径）。
+    返回 None 的情况绝不能报错，否则老客户端或未上报视口时会整条流挂掉。
+    """
+    try:
+        rx = int(float(qs.get('rx', '')))
+        ry = int(float(qs.get('ry', '')))
+        rw = int(float(qs.get('rw', '')))
+        rh = int(float(qs.get('rh', '')))
+    except Exception:
+        return None
+    if rw <= 0 or rh <= 0:
+        return None
+    sw, sh = screen.width, screen.height
+    if rx < 0:
+        rx = 0
+    if ry < 0:
+        ry = 0
+    if rx >= sw or ry >= sh:
+        return None
+    rw = min(rw, sw - rx)
+    rh = min(rh, sh - ry)
+    if rw < 8 or rh < 8:              # 太小没有意义，也避免建 1px 位图
+        return None
+    if rw * rh >= sw * sh * 0.92:     # 几乎全屏：直接整帧，省掉 ROI 的额外位图与判断
+        return None
+    return (rx, ry, rw, rh)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -591,14 +717,16 @@ class Handler(BaseHTTPRequestHandler):
                 scale = float(qs.get('scale', 1.0))
                 quality = int(qs.get('q', 60))
                 gray = str(qs.get('gray', '0')) in ('1', 'true', 'yes')
+                cursor = str(qs.get('cursor', '1')) in ('1', 'true', 'yes')
                 still_thr = float(qs.get('still_thr', STILL_THRESHOLD))
             except Exception:
-                scale, quality, gray, still_thr = 1.0, 60, False, STILL_THRESHOLD
+                scale, quality, gray, cursor, still_thr = 1.0, 60, False, True, STILL_THRESHOLD
             scale = max(0.2, min(1.0, scale))
             quality = max(10, min(95, quality))
             still_thr = max(0.0, min(64.0, still_thr))
+            rect = parse_rect(qs, _STATE.screen)
             try:
-                data, fhash = encode_frame(scale, quality, gray, still_thr)
+                data, fhash, srect = encode_frame(scale, quality, gray, still_thr, cursor, rect)
             except Exception as e:
                 self._json({'ok': False, 'error': 'grab failed: %s' % e}, 500)
                 return
@@ -606,6 +734,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'image/jpeg')
             self.send_header('Content-Length', str(len(data)))
             self.send_header('X-Frame-Hash', fhash)
+            if srect:
+                # 实际服务的区域（可能被夹取过）：客户端必须按这个值定位补丁，不能用自己上报的
+                self.send_header('X-Frame-Rect', '%d,%d,%d,%d' % srect)
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             self.wfile.write(data)
@@ -624,8 +755,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({'ok': False, 'error': 'bad json: %s' % e}, 400)
             return
+        # 支持数组：后端的高频输入（滚轮 30ms 节流 ≈ 33 次/秒）可以整批一次送达，
+        # 省掉逐条的 HTTP 往返。旧版后端逐条发单事件时行为不变。
         try:
-            _STATE.input.dispatch(ev)
+            if isinstance(ev, list):
+                for one in ev:
+                    _STATE.input.dispatch(one)
+            else:
+                _STATE.input.dispatch(ev)
             self._json({'ok': True})
         except Exception as e:
             self._json({'ok': False, 'error': str(e)}, 400)

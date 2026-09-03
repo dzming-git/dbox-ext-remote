@@ -8,7 +8,10 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: #0e1116; color: #e6e9ef;
     font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
-  #app { display: flex; flex-direction: column; height: 100%; }
+  body { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  #app { display: flex; flex-direction: column; height: 100%;
+    /* 键盘/候选栏避让的位移做短过渡：任何必要的微调变成平滑滑入，杜绝突跳式「二次上移」观感 */
+    transition: transform .12s ease, height .12s ease; }
 
   /* ---- 工具条 ---- */
   .bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px;
@@ -63,11 +66,55 @@
     font-size: 11.5px; color: #6e7681; }
   .foot .warn { color: #d29922; }
   .foot .sp { flex: 1; }
-  /* 软键盘输入框：必须**留在视口内**（不能 left:-9999px 移出屏幕），否则 iOS/Android
-     不会为屏外可编辑元素弹软键盘。opacity:0 + 1px 即可隐藏又不挡操作；font-size:16px
-     避免 iOS 聚焦时自动放大；caret-color:transparent 隐藏光标闪烁。 */
-  #kb { position: absolute; opacity: 0; width: 1px; height: 1px; left: 0; top: 0;
-    font-size: 16px; caret-color: transparent; }
+  /* 软键盘输入框：必须**留在视口内**（不能 left:-9999px 移出屏幕），否则 webview 不弹键盘。
+     opacity:0 隐形；font-size:16px 避免 iOS 聚焦自动放大；caret-color:transparent 隐藏光标。
+     关键：保持在正常流、紧随 #app 之后、高度仅 1px——focus 时 #kb 落在 #app 正下方(=可视高顶部)，
+     adjustPan 为把它露出键盘而把整窗上移，#app 整块落到键盘之上。height 保持极小（绝撑高 body），
+     否则平移目标会落到键盘下方、反倒把内容顶没。 */
+  #kb { position: relative; opacity: 0; width: 100%; height: 1px; border: 0; margin: 0;
+    padding: 0; display: block; resize: none; font-size: 16px; caret-color: transparent; }
+
+  /* ---- 点击反馈动画 ---- */
+  .click-fx { position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px;
+    border: 2px solid #58a6ff; border-radius: 50%; pointer-events: none; z-index: 4;
+    box-shadow: 0 0 8px #58a6ff99; animation: clickpop .36s ease-out forwards; }
+  @keyframes clickpop {
+    0%   { transform: scale(.4); opacity: .9; }
+    100% { transform: scale(2.6); opacity: 0; }
+  }
+
+  /* ---- 触摸指示器：按下**立刻**显示 ----
+     解决两个体验问题：
+     ① 此前只有松手才出波纹，按下瞬间用户不知道自己按在了哪里——现在按下即有落点指示。
+     ② 长按阈值(550ms)对用户完全不可见——内圈在 RIGHT_DELAY 内逐渐长满，
+        长满即触发右键，用户能直观看到「还要按住多久」，不必猜两个时间段。 */
+  /* z-index 取 4（与 click-fx 同级）：高于画布，但低于 z-index:5 的引导浮层，
+     这样代理未运行等浮层出现时能正常盖住它。 */
+  .touch-ind { position: absolute; width: 48px; height: 48px; margin: -24px 0 0 -24px;
+    border-radius: 50%; pointer-events: none; z-index: 4; display: none;
+    border: 2px solid rgba(88,166,255,.9); box-shadow: 0 0 10px rgba(88,166,255,.45);
+    background: rgba(88,166,255,.08); }
+  .touch-ind.on { display: block; }
+  /* 内圈 = 长按进度：时长由 --dur 与 RIGHT_DELAY 保持一致 */
+  .touch-ind .fill { position: absolute; top: 7px; left: 7px; right: 7px; bottom: 7px;
+    border-radius: 50%; background: rgba(88,166,255,.5); transform: scale(0); }
+  .touch-ind.charging .fill { transform: scale(1); transition: transform var(--dur, 550ms) linear; }
+  /* 长按完成 → 右键：变绿，明确告知已触发 */
+  .touch-ind.right { border-color: #3fb950; box-shadow: 0 0 14px rgba(63,185,80,.75);
+    background: rgba(63,185,80,.14); }
+  .touch-ind.right .fill { background: rgba(63,185,80,.8); transform: scale(1); transition: none; }
+  /* 判定为平移视角（未武装就拖动）：取消充电并淡化，明确表示「这次不会点击远端」 */
+  .touch-ind.drag { border-color: rgba(139,148,158,.8); box-shadow: none; opacity: .5; }
+  .touch-ind.drag .fill { transform: scale(0); transition: transform .12s ease-out; }
+  /* 已武装（按住满 DRAG_HOLD）：橙色 = 此时拖动将**拖拽远端内容**，而非平移视角。
+     内圈仍在长，继续按住到 RIGHT_DELAY 会转绿触发右键。 */
+  .touch-ind.armed { border-color: #d29922; box-shadow: 0 0 14px rgba(210,153,34,.7);
+    background: rgba(210,153,34,.14); }
+  .touch-ind.armed .fill { background: rgba(210,153,34,.85); }
+  /* 正在远程拖拽（左键已按下并跟随） */
+  .touch-ind.remote { border-color: #a371f7; box-shadow: 0 0 16px rgba(163,113,247,.8);
+    background: rgba(163,113,247,.18); }
+  .touch-ind.remote .fill { background: rgba(163,113,247,.85); transform: scale(1); transition: none; }
 </style>
 </head>
 <body>
@@ -76,7 +123,8 @@
     <span class="state"><i class="dot" id="dot"></i><span id="state-txt">连接中…</span></span>
     <button id="btn-reconnect" title="断开后手动重连（也可等自动重连）">⟳ 重连</button>
     <button id="btn-restart-agent" title="重启桌面代理进程（应用输入/绘制等修复时用到；会短暂断一下）">⟲ 重启代理</button>
-    <button id="btn-kb" title="呼出/收起手机软键盘（点此后再点画面即可输入文字）">⌨ 键盘</button>
+    <button id="btn-kb" title="弹出手机软键盘（再点此或系统收起键即可关闭）">⌨ 键盘</button>
+    <button id="btn-cursor" class="on" title="显示 / 隐藏远程鼠标指针（指针烘焙进画面，切换会重建画面流）">🖱 鼠标</button>
     <span class="sep"></span>
     <button data-fit="1" title="缩放至适应窗口">适应</button>
     <button data-fit="0" title="按屏幕原始像素 1:1 显示">100%</button>
@@ -118,10 +166,10 @@
     <span id="f-meta">—</span>
     <span class="sp"></span>
     <span class="warn" id="f-warn"></span>
-    <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移 · 触屏：单指拖＝拖动，长按＝右键，双指捏合＝缩放/平移</span>
+    <span id="f-tip">滚轮＝远程滚动 · Ctrl+滚轮＝本地缩放 · 中键拖拽＝平移 · 触屏：单指滑＝平移视角，轻点＝左键，长按＝右键，双指捏合＝缩放/平移</span>
   </div>
-  <textarea id="kb" autocomplete="off" spellcheck="false"></textarea>
 </div>
+<textarea id="kb" autocomplete="off" spellcheck="false"></textarea>
 
 <script>
 (function () {
@@ -138,40 +186,127 @@
     });
   }
 
-  // ---- token：优先读宿主写进 localStorage 的最新 token ----
+  // ---- token：**宿主实时推送的优先** ----
+  // access token 有效期只有 24 小时（ACCESS_TOKEN_EXPIRE_HOURS），且刷新令牌续签后
+  // 新 token 由宿主经 postMessage 下发。旧实现把 localStorage 那份排在 PUSHED 前面，
+  // 于是过期 token 会一直被优先使用——叠加 /status 对 401 的静默处理，
+  // 表现就是「重启电脑/隔天再进来，永远卡在重连中，且毫无提示」。
   var PUSHED = null;
   window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'DBOX_TOKEN' && e.data.token) PUSHED = e.data.token;
   });
-  try { window.parent.postMessage({ type: 'DBOX_REQUEST_TOKEN', extId: 'remote' }, '*'); } catch (_) {}
+  function requestToken() {
+    try { window.parent.postMessage({ type: 'DBOX_REQUEST_TOKEN', extId: 'remote' }, '*'); } catch (_) {}
+  }
+  requestToken();
   function token() {
     try {
-      return localStorage.getItem('token') || localStorage.getItem('access_token')
-        || sessionStorage.getItem('token') || PUSHED || '';
+      return PUSHED || localStorage.getItem('token') || localStorage.getItem('access_token')
+        || sessionStorage.getItem('token') || '';
     } catch (_) { return PUSHED || ''; }
   }
+  // 401 多半是 token 过期：先向宿主再要一次最新 token，稍等其送达后重试一次。
+  // 宿主会自动续签 access token，这一步让「隔天进来」的场景自愈，不必手动刷新页面。
   function api(path, opts) {
     opts = opts || {};
-    return fetch(API + path, Object.assign({}, opts, {
-      headers: Object.assign({ 'Authorization': 'Bearer ' + token() }, opts.headers || {}),
-    }));
+    function once() {
+      return fetch(API + path, Object.assign({}, opts, {
+        headers: Object.assign({ 'Authorization': 'Bearer ' + token() }, opts.headers || {}),
+      }));
+    }
+    return once().then(function (r) {
+      if (r.status !== 401) return r;
+      requestToken();
+      return new Promise(function (res) { setTimeout(res, 400); }).then(once);
+    });
   }
 
   // ---- 状态 ----
-  var PRESETS = {
-    smooth:   { fps: 15, q: 72, scale: 100, gray: false, still: false },
-    balanced: { fps: 8,  q: 60, scale: 100, gray: false, still: true },
-    saver:    { fps: 3,  q: 42, scale: 70,  gray: false, still: true },
+  var BASE_PRESETS = {   // 永不随服务端 presets 响应被覆盖的基准，切换/重置兜底用
+    smooth:   { fps: 15, q: 72, scale: 100, gray: false, still: false, cursor: true },
+    balanced: { fps: 8,  q: 60, scale: 100, gray: false, still: true,  cursor: true },
+    saver:    { fps: 3,  q: 42, scale: 70,  gray: false, still: true,  cursor: true },
   };
-  var cfg = Object.assign({}, PRESETS.balanced);
+  var PRESETS = Object.assign({}, BASE_PRESETS);   // 可被服务端 d.presets 局部覆盖，但三档基准始终在
+  var cfg = Object.assign({}, BASE_PRESETS.balanced);
   var presetName = 'balanced';
   var screenW = 0, screenH = 0;      // 屏幕真实尺寸（用于坐标映射，取自 /status）
   var zoom = 1, fitMode = true;
+
+  // ================= 参数 / 视图持久化（单键原子 JSON）=================
+  // 教训：旧实现只存 fitMode 不存 zoom 与滚动——刷新后 zoom 重置为 1，而 fitMode=false 时
+  // applyZoom 不再重算缩放，画面被放大到 100%，滚动又归零 → 甩到左上角。所以「缩放模式 + 缩放值 + 横纵滚动」必须一起存。
+  // 统一写进一个 JSON（remote_prefs）避免多键不一致；读取时逐字段校验，非法值丢弃回基准。
+  var PREF_KEY = 'remote_prefs';
+  var savedView = { sl: 0, st: 0 };      // 待还原的平移位置（画布尺寸就绪后才写入）
+  function numOr(v, lo, hi, dft) { return (typeof v === 'number' && isFinite(v) && v >= lo && v <= hi) ? v : dft; }
+  function boolOr(v, dft) { return (typeof v === 'boolean') ? v : dft; }
+
+  function readPrefs() {
+    var raw = null;
+    try { raw = localStorage.getItem(PREF_KEY); }
+    catch (e) { try { raw = window.parent.localStorage.getItem(PREF_KEY); } catch (e2) {} }
+    try {
+      var o = JSON.parse(raw || 'null');
+      if (o && o.cfg) {
+        cfg.fps   = numOr(o.cfg.fps, 1, 30, cfg.fps);
+        cfg.q     = numOr(o.cfg.q, 20, 95, cfg.q);
+        cfg.scale = numOr(o.cfg.scale, 30, 100, cfg.scale);   // 分辨率非法 → 退回 100（清晰）
+        cfg.gray   = boolOr(o.cfg.gray, cfg.gray);
+        cfg.still  = boolOr(o.cfg.still, cfg.still);
+        cfg.cursor = boolOr(o.cfg.cursor, cfg.cursor);
+      }
+      if (o && o.preset && BASE_PRESETS[o.preset]) presetName = o.preset;
+      if (o && o.view) {
+        fitMode = boolOr(o.view.fit, fitMode);
+        zoom    = numOr(o.view.zoom, 0.1, 4, zoom);           // 手动缩放值一并还原
+        savedView.sl = numOr(o.view.sl, 0, 1e6, 0);
+        savedView.st = numOr(o.view.st, 0, 1e6, 0);
+      }
+    } catch (e) {}
+    $('btn-cursor').classList.toggle('on', !!cfg.cursor);   // 按钮初始态跟随已存设置
+    $('preset').value = presetName;
+  }
+  function writePrefs() {
+    var o = {
+      cfg: { fps: cfg.fps, q: cfg.q, scale: cfg.scale, gray: cfg.gray, still: cfg.still, cursor: cfg.cursor },
+      preset: presetName,
+      view: { fit: fitMode, zoom: zoom, sl: view ? view.scrollLeft : 0, st: view ? view.scrollTop : 0 },
+    };
+    var s = JSON.stringify(o);
+    try { localStorage.setItem(PREF_KEY, s); }
+    catch (e) { try { window.parent.localStorage.setItem(PREF_KEY, s); } catch (e2) {} }
+  }
+  var prefT = null;
+  function savePrefsSoon() { clearTimeout(prefT); prefT = setTimeout(writePrefs, 200); }   // 捏合/滚动等高频变更防抖落盘
+  readPrefs();
+  // 清理旧版多键存档（remote_cfg / remote_preset / remote_fitMode），避免残留干扰
+  ['remote_cfg', 'remote_preset', 'remote_fitMode'].forEach(function (k) {
+    try { localStorage.removeItem(k); } catch (e) { try { window.parent.localStorage.removeItem(k); } catch (e2) {} }
+  });
+
+  // 画布尺寸就绪（screenW 已知且 applyZoom 已铺好画布）后还原平移位置，只做一次。
+  var viewRestored = false;
+  function restoreView() {
+    if (viewRestored || !screenW) return;
+    viewRestored = true;
+    if (fitMode) return;                                  // 适应模式内容自适应，无需平移
+    var maxL = Math.max(0, view.scrollWidth - view.clientWidth);
+    var maxT = Math.max(0, view.scrollHeight - view.clientHeight);
+    view.scrollLeft = Math.min(savedView.sl, maxL);
+    view.scrollTop = Math.min(savedView.st, maxT);
+  }
   var online = false, autostart = false;
   var retry = 0, retryTimer = null, pollTimer = null;
 
   var view = $('view');
   var canvas = $('screen');
+  // 画面四周留黑边缓冲：远端屏幕边缘不与手机屏幕边缘贴合，方便点击靠近屏幕边缘的元素。
+  // 取屏幕尺寸较小边的一定比例，夹在 [20,40] 之间，保证手机/桌面都留得舒服。
+  // 该值同时用于 fit 缩放计算（扣掉边距）与 .view 的实际 padding，务必同源。
+  var EDGE_PAD = Math.round(Math.min(window.innerWidth, window.innerHeight) * 0.06);
+  EDGE_PAD = Math.max(20, Math.min(40, EDGE_PAD));
+  view.style.padding = EDGE_PAD + 'px';
   var ctx = canvas.getContext('2d');
   var ov = $('ov');
 
@@ -187,6 +322,7 @@
     return API + '/stream?token=' + encodeURIComponent(token())
       + '&fps=' + cfg.fps + '&q=' + cfg.q + '&scale=' + (cfg.scale / 100)
       + '&gray=' + (cfg.gray ? 1 : 0) + '&still=' + (cfg.still ? 1 : 0)
+      + '&cursor=' + (cfg.cursor ? 1 : 0)
       + '&_t=' + Date.now();
   }
 
@@ -210,6 +346,7 @@
     return -1;
   }
   // 从缓冲里切出完整帧：--frame\r\n<headers>\r\n\r\n<数据>
+  // rect：本帧只是「屏幕的某块区域」时由服务端带在 X-Frame-Rect 里（ROI 省流量），整帧时为 null。
   function splitFrames(u8) {
     var frames = [], start = 0;
     for (;;) {
@@ -223,20 +360,42 @@
       var len = parseInt(m[1], 10);
       var ds = he + 4;
       if (u8.length < ds + len) break;          // 数据没到齐，等下一块
-      frames.push(u8.subarray(ds, ds + len));
+      var rm = /X-Frame-Rect:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(hdr);
+      frames.push({
+        data: u8.subarray(ds, ds + len),
+        rect: rm ? { x: +rm[1], y: +rm[2], w: +rm[3], h: +rm[4] } : null,
+      });
       start = ds + len;
     }
     return { frames: frames, rest: u8.subarray(start) };
   }
 
-  async function drawFrame(u8) {
+  // 改画布尺寸必然清空内容，故先把旧画面按比例搬过去，避免切进/切出 ROI 时闪黑。
+  function resizeCanvas(w, h) {
+    var old = null;
+    if (canvas.width && canvas.height) {
+      try {
+        old = document.createElement('canvas');
+        old.width = canvas.width; old.height = canvas.height;
+        old.getContext('2d').drawImage(canvas, 0, 0);
+      } catch (e) { old = null; }
+    }
+    canvas.width = w; canvas.height = h;
+    if (old) ctx.drawImage(old, 0, 0, w, h);
+  }
+
+  // rect 非 null → 这是屏幕的一块区域，画布保持「整屏后备」尺寸，只把这块贴到对应位置。
+  // 关键：画布始终代表整块屏幕，toScreen() 的坐标映射与输入定位就完全不用改。
+  async function drawFrame(u8, rect) {
     try {
       var bmp = await createImageBitmap(new Blob([u8], { type: 'image/jpeg' }));
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
+      if (rect) {
+        if (canvas.width !== screenW || canvas.height !== screenH) resizeCanvas(screenW, screenH);
+        ctx.drawImage(bmp, rect.x, rect.y, rect.w, rect.h);
+      } else {
+        if (canvas.width !== bmp.width || canvas.height !== bmp.height) resizeCanvas(bmp.width, bmp.height);
+        ctx.drawImage(bmp, 0, 0);
       }
-      ctx.drawImage(bmp, 0, 0);
       bmp.close();
       stat.frames++;
       return true;
@@ -253,6 +412,7 @@
     setState('wait', '连接中');
     try {
       var resp = await fetch(streamURL(), { signal: ctl.signal, cache: 'no-store' });
+      if (resp.status === 401) requestToken();   // 令牌过期：索要新 token，下一次重连即可用上
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var reader = resp.body.getReader();
       var buf = new Uint8Array(0);
@@ -264,7 +424,7 @@
         var res = splitFrames(buf);
         buf = res.rest;
         for (var i = 0; i < res.frames.length; i++) {
-          if (await drawFrame(res.frames[i])) {
+          if (await drawFrame(res.frames[i].data, res.frames[i].rect)) {
             retry = 0;
             setWarn('');
             setState('on', '已连接');
@@ -304,18 +464,113 @@
     if (!screenW) return;
     if (fitMode) {
       var r = view.getBoundingClientRect();
-      var s = Math.min(r.width / screenW, r.height / screenH);
+      // r 含 padding，扣掉四周 EDGE_PAD 得到可用内容区，否则画布会溢出边距贴到手机屏幕边缘
+      var s = Math.min((r.width - 2 * EDGE_PAD) / screenW, (r.height - 2 * EDGE_PAD) / screenH);
       zoom = Math.max(0.1, Math.min(s, 1));
     }
     canvas.style.width = Math.round(screenW * zoom) + 'px';
     canvas.style.height = Math.round(screenH * zoom) + 'px';
     $('zoom-val').textContent = Math.round(zoom * 100) + '%';
     updateMeta();
+    scheduleRoi();
   }
-  function setZoom(z, keepFit) {
+
+  // ---------------------------------------------------------------- ROI（只传正在看的区域）
+  // 用户多数时间在放大看某个区域，整屏采集+编码的绝大多数像素都被浪费了。
+  // 这里算出视口对应的屏幕矩形上报服务端，让它只抓、只编码、也只检测变化这一块；
+  // 省下的带宽足以把分辨率提到原生（比降采样更清晰），静止检测也更容易命中。
+  // 画布始终代表整块屏幕（见 drawFrame），故坐标映射与输入定位完全不受影响。
+  var ROI_MARGIN = 0.25;     // 四周余量：小幅平移直接复用已收到的像素，不必重新推帧
+  var ROI_MIN_GAIN = 0.92;   // 区域占比超过它就没省流量的意义，退回整帧
+  var sentRoi = null, roiT = null;
+
+  // 视口（不含余量）对应的屏幕矩形；越界部分不算——那部分本来就看不见
+  function calcViewRect() {
+    if (!screenW || !screenH) return null;
+    var vr = view.getBoundingClientRect();
+    var cr = canvas.getBoundingClientRect();
+    if (!cr.width || !cr.height) return null;
+    var l = Math.max(vr.left, cr.left), t = Math.max(vr.top, cr.top);
+    var r = Math.min(vr.right, cr.right), b = Math.min(vr.bottom, cr.bottom);
+    if (r <= l || b <= t) return null;
+    return {
+      x0: Math.max(0, Math.floor((l - cr.left) / cr.width * screenW)),
+      y0: Math.max(0, Math.floor((t - cr.top) / cr.height * screenH)),
+      x1: Math.min(screenW, Math.ceil((r - cr.left) / cr.width * screenW)),
+      y1: Math.min(screenH, Math.ceil((b - cr.top) / cr.height * screenH)),
+    };
+  }
+
+  function calcRoi() {
+    var v = calcViewRect();
+    if (!v || v.x1 - v.x0 <= 0 || v.y1 - v.y0 <= 0) return null;
+    var mx = Math.round((v.x1 - v.x0) * ROI_MARGIN), my = Math.round((v.y1 - v.y0) * ROI_MARGIN);
+    var x0 = Math.max(0, v.x0 - mx), y0 = Math.max(0, v.y0 - my);
+    var x1 = Math.min(screenW, v.x1 + mx), y1 = Math.min(screenH, v.y1 + my);
+    if (x1 - x0 <= 0 || y1 - y0 <= 0) return null;
+    if ((x1 - x0) * (y1 - y0) >= screenW * screenH * ROI_MIN_GAIN) return null;   // 接近全屏 → 退回整帧
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
+  function roiSame(a, b) {
+    return (!a && !b) || !!(a && b && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h);
+  }
+
+  function reportRoi() {
+    var v = calcViewRect();
+    var r = calcRoi();
+    // 视口仍完整落在已上报区域内 → 手上像素还够用，不必惊动服务端（连续平移时几乎不产生上报）
+    if (r && sentRoi && v && v.x0 >= sentRoi.x && v.y0 >= sentRoi.y &&
+        v.x1 <= sentRoi.x + sentRoi.w && v.y1 <= sentRoi.y + sentRoi.h) return;
+    if (roiSame(r, sentRoi)) return;
+    sentRoi = r;
+    updateMeta();
+    api('/viewport', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(r ? { x: r.x, y: r.y, w: r.w, h: r.h } : { none: true }),
+    }).catch(function () {});
+  }
+  function scheduleRoi() { clearTimeout(roiT); roiT = setTimeout(reportRoi, 120); }
+  // 锚点缩放：缩放时保持客户端锚点 (ax,ay) 下的内容不动（默认视口中心）。
+  // 双指捏合传「初始双指中点」做锚点，缩放即围绕该点、跟手不漂移。
+  function setZoom(z, keepFit, ax, ay) {
     fitMode = !!keepFit;
-    zoom = Math.max(0.25, Math.min(4, z));
+    z = Math.max(0.1, Math.min(4, z));
+    var vr = view.getBoundingClientRect();
+    var cr = canvas.getBoundingClientRect();
+    if (ax == null) { ax = vr.left + vr.width / 2; ay = vr.top + vr.height / 2; }
+    var cx = (ax - cr.left) / cr.width * screenW;   // 锚点对应的内容坐标（屏幕像素）
+    var cy = (ay - cr.top) / cr.height * screenH;
+    zoom = z;
     applyZoom();
+    // 让该内容坐标在缩放后仍停留在原客户端位置 (ax,ay)
+    // 注意 +EDGE_PAD：content 盒相对 border-box 左/上偏移了一个 padding，scrollLeft=0 时
+    // 内容左缘在 vr.left+EDGE_PAD 处，算滚动量必须把这个偏移补回来（否则锚点偏一个边距）。
+    view.scrollLeft = vr.left + EDGE_PAD - ax + cx * z;
+    view.scrollTop = vr.top + EDGE_PAD - ay + cy * z;
+    savePrefsSoon();      // 缩放值与平移位置一并落盘（防抖：捏合高频变更不卡顿）
+    scheduleRoi();        // 缩放会改变可见区域 → 重新上报 ROI
+  }
+
+  // 双指手势的统一表达：把「屏幕内容点 (cxp,cyp)」摆到「客户端位置 (ax,ay)」，同时把缩放设为 z。
+  // setZoom 只能让 (ax,ay) 处的内容**原地不动**（缩放锚点＝目标点，二者是同一点）；
+  // 这里把它拆成「内容点」与「目标位置」两个独立量，于是**缩放与平移可以同时发生**：
+  //   (cxp,cyp) = 手势开始时双指中心下的内容（锚点，全程固定不变）
+  //   (ax,ay)   = 当前双指中心
+  // 手指中心移动 → 目标位置移动 → 画面跟着手指走；手指间距变化 → z 变化 → 以锚点为中心缩放。
+  function setZoomAt(z, cxp, cyp, ax, ay) {
+    fitMode = false;
+    z = Math.max(0.1, Math.min(4, z));
+    zoom = z;
+    applyZoom();
+    // canvas 左上角的客户端坐标 = vr.left + EDGE_PAD - view.scrollLeft
+    // 故内容点 (cxp,cyp) 的客户端位置 = vr.left + EDGE_PAD - scrollLeft + cxp*z，令其等于 ax：
+    var vr = view.getBoundingClientRect();
+    view.scrollLeft = vr.left + EDGE_PAD + cxp * z - ax;
+    view.scrollTop = vr.top + EDGE_PAD + cyp * z - ay;
+    savePrefsSoon();
+    scheduleRoi();
   }
   $('zoom-in').addEventListener('click', function () { setZoom(zoom * 1.25, false); });
   $('zoom-out').addEventListener('click', function () { setZoom(zoom / 1.25, false); });
@@ -323,8 +578,11 @@
     b.addEventListener('click', function () {
       if (b.dataset.fit === '1') { fitMode = true; applyZoom(); }
       else { fitMode = false; setZoom(1, false); }
+      writePrefs();
     });
   });
+  // 平移/缩放都改变可见区域：落盘 + 重新上报 ROI（均防抖，连续拖动也不会刷爆请求）
+  view.addEventListener('scroll', function () { savePrefsSoon(); scheduleRoi(); });
   $('btn-fs').addEventListener('click', function () {
     if (document.fullscreenElement) document.exitFullscreen();
     else if (view.requestFullscreen) view.requestFullscreen();
@@ -334,8 +592,35 @@
   var MOVE_MS = 30;          // 鼠标移动节流：再密也没有意义，只会白烧流量
   var lastMove = 0, pending = null, composing = false;
 
+  // ---- 输入通道：优先 WebSocket，不可用时自动降级 HTTP ----
+  // HTTP 下每个输入事件都是一次 POST，要 浏览器→主服务→扩展宿主→代理 三跳；
+  // 滚轮 30ms 节流就是 33 req/s，手机网络下 RTT 几十毫秒 + 同域并发排队 → 输入延迟雪崩。
+  // WS 一次握手后每个事件只是一个帧，没有 per-event HTTP 开销、也不受并发排队影响。
+  // 注意必须**直连扩展宿主**：主服务代理不处理 Upgrade: websocket，握手过不去，
+  // 所以 ws_port 由 /status 下发，前端据此拼直连地址。
+  var inputWs = null, wsOpen = false, wsRetry = 0, wsTimer = null, wsPort = 0;
+
+  function wsConnect() {
+    if (!wsPort || typeof WebSocket === 'undefined') return;
+    if (inputWs && (wsOpen || inputWs.readyState === 0)) return;   // 已连接 / 连接中
+    var url = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+      + location.hostname + ':' + wsPort + API + '/ws?token=' + encodeURIComponent(token());
+    try { inputWs = new WebSocket(url); } catch (_) { inputWs = null; return; }
+    inputWs.onopen = function () { wsOpen = true; wsRetry = 0; };
+    inputWs.onclose = function () { wsOpen = false; inputWs = null; scheduleWs(); };
+    inputWs.onerror = function () { try { inputWs.close(); } catch (_) {} };
+  }
+  function scheduleWs() {
+    clearTimeout(wsTimer);
+    wsTimer = setTimeout(wsConnect, Math.min(8000, 500 * Math.pow(2, wsRetry++)));
+  }
+
   function send(ev) {
     if (!online) return;
+    if (wsOpen && inputWs && inputWs.readyState === 1) {
+      try { inputWs.send(JSON.stringify(ev)); return; } catch (_) { wsOpen = false; }
+    }
+    // 降级：WS 不可用/未就绪时仍走 HTTP，保证功能不中断
     fetch(API + '/input', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json' },
@@ -368,29 +653,85 @@
     if (pending) { send({ type: 'mouse_move', x: pending.x, y: pending.y }); pending = null; }
   }, MOVE_MS * 2);
 
+  var downSent = false;   // 仅当在画布上真正按下左/右键，松手才发 mouse_up；点在画布外（如操作栏）不算
   canvas.addEventListener('mousedown', function (e) {
     if (touchActive) return;
     e.preventDefault();
     var p = toScreen(e.clientX, e.clientY);
     if (!p) return;
     if (e.button === 1) { startPan(e); return; }   // 中键：本地平移，不发给远程
+    spawnClickFx(e.clientX, e.clientY);             // 点击反馈动画（非中键）
     send({ type: 'mouse_down', x: p.x, y: p.y, button: btnName(e.button) });
+    downSent = true;
   });
   window.addEventListener('mouseup', function (e) {
-    if (touchActive) return;
+    if (touchActive || !downSent) return;
+    downSent = false;
     var p = toScreen(e.clientX, e.clientY);
-    if (p) send({ type: 'mouse_up', x: p.x, y: p.y, button: btnName(e.button) });
+    if (p) {
+      p.x = Math.max(0, Math.min(screenW, p.x));   // 拖出画布外松手：坐标贴边，不越界
+      p.y = Math.max(0, Math.min(screenH, p.y));
+      send({ type: 'mouse_up', x: p.x, y: p.y, button: btnName(e.button) });
+    }
   });
   canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
   canvas.addEventListener('wheel', function (e) {
     if (e.ctrlKey) {                  // Ctrl+滚轮 = 本地缩放，远程无感
       e.preventDefault();
-      setZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12), false);
+      setZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12), false, e.clientX, e.clientY);
       return;
     }
     e.preventDefault();
     send({ type: 'wheel', dx: e.deltaX, dy: -e.deltaY });
   }, { passive: false });
+
+  // 点击反馈：在 (clientX,clientY) 处生成一个扩散圆环，约 380ms 后自动移除。
+  // 坐标换算到 .view 内容坐标系（含滚动），圆环随画布滚动、位置贴合点击点。
+  function spawnClickFx(clientX, clientY) {
+    var vr = view.getBoundingClientRect();
+    var el = document.createElement('div');
+    el.className = 'click-fx';
+    el.style.left = (clientX - vr.left + view.scrollLeft) + 'px';
+    el.style.top = (clientY - vr.top + view.scrollTop) + 'px';
+    view.appendChild(el);
+    setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 380);
+  }
+
+  // ---- 触摸指示器：按下即显示落点，并把长按阈值做成可见的进度 ----
+  var touchInd = document.createElement('div');
+  touchInd.className = 'touch-ind';
+  touchInd.innerHTML = '<div class="fill"></div>';
+  view.appendChild(touchInd);
+
+  function indSetPos(clientX, clientY) {
+    var vr = view.getBoundingClientRect();
+    touchInd.style.left = (clientX - vr.left + view.scrollLeft) + 'px';
+    touchInd.style.top = (clientY - vr.top + view.scrollTop) + 'px';
+  }
+  var indHideT = null;
+  function indStart(clientX, clientY) {
+    clearTimeout(indHideT);
+    touchInd.className = 'touch-ind';                    // 先清掉 charging，确保 transition 重新起效
+    touchInd.style.setProperty('--dur', RIGHT_DELAY + 'ms');
+    indSetPos(clientX, clientY);
+    void touchInd.offsetWidth;                           // 强制重排，否则同一帧内加 class 不会有过渡
+    touchInd.className = 'touch-ind on charging';
+  }
+  function indMove(clientX, clientY) { indSetPos(clientX, clientY); }
+  function indDrag() { clearTimeout(indHideT); touchInd.className = 'touch-ind on drag'; }
+  // armed：按住满 DRAG_HOLD —— 此时拖动 = 拖拽远端内容（内圈继续长，满 RIGHT_DELAY 转右键）
+  function indArm() { clearTimeout(indHideT); touchInd.className = 'touch-ind on charging armed'; }
+  function indRemote() { clearTimeout(indHideT); touchInd.className = 'touch-ind on remote'; }
+  function indRight() { clearTimeout(indHideT); touchInd.className = 'touch-ind on right'; }
+  // delay>0：保留一小段时间再收，用于让右键的绿色确认「看得见」（否则一松手就没了）
+  function indHide(delay) {
+    clearTimeout(indHideT);
+    if (delay) {
+      indHideT = setTimeout(function () { touchInd.className = 'touch-ind'; }, delay);
+      return;
+    }
+    touchInd.className = 'touch-ind';
+  }
 
   function btnName(b) { return b === 2 ? 'right' : b === 1 ? 'middle' : 'left'; }
 
@@ -410,7 +751,7 @@
 
   // ---- 键盘：隐藏 textarea 接管，中文等输入法内容才能正确上屏 ----
   var kb = $('kb');
-  canvas.addEventListener('click', function () { kb.focus({ preventScroll: true }); });
+  // 注意：canvas 点击**不再**自动聚焦 #kb —— 否则一碰屏幕软键盘就弹、且关不掉。
   var SPECIAL = {
     enter: 1, backspace: 1, tab: 1, escape: 1, esc: 1, delete: 1, insert: 1,
     home: 1, end: 1, pageup: 1, pagedown: 1, arrowleft: 1, arrowup: 1,
@@ -442,26 +783,139 @@
     if (justComposed) { justComposed = false; return; }  // 吞掉 compositionend 后的尾随 input
     if (kb.value) { send({ type: 'text', text: kb.value }); kb.value = ''; }
   });
-  // 软键盘开关：手机端没有 click 可聚焦 #kb（canvas touchstart 抑制了合成 click），
-  // 所以需要一个按钮在用户手势里 focus 它来唤起软键盘；再点一次收起。
-  var kbOn = false;
+  // 键盘=动作而非状态：点按钮弹出软键盘；关闭交给用户（系统收起键 / 再点按钮失焦等）。
   $('btn-kb').addEventListener('click', function (e) {
     e.stopPropagation();
-    kbOn = !kbOn;
-    this.classList.toggle('on', kbOn);
-    if (kbOn) kb.focus({ preventScroll: true });
-    else { kb.blur(); kb.value = ''; }
+    if (document.activeElement === kb) kb.blur();          // 已开 → 收起
+    else kb.focus({ preventScroll: true });               // 未开 → 弹出
   });
+  // 显示 / 隐藏远程鼠标指针：指针烘焙进抓屏帧，切换需重建画面流才生效
+  $('btn-cursor').addEventListener('click', function () {
+    cfg.cursor = !cfg.cursor;
+    this.classList.toggle('on', cfg.cursor);
+    lastStreamKey = '';          // 强制重建流
+    startStream();
+    writePrefs();
+  });
+  // 按钮高亮跟随真实焦点，避免手动 toggle 与系统收起失同步（之前要按两次才正常）
+  function syncKbBtn() { $('btn-kb').classList.toggle('on', document.activeElement === kb); }
+  kb.addEventListener('focus', syncKbBtn);
+  kb.addEventListener('blur', syncKbBtn);
 
-  // ---- 触摸端交互（手机）----
-  // 单指：轻点＝左键单击；按住拖动＝先定位光标再按住左键拖动（选字/挪窗口）；长按＝右键。
-  // 双指：捏合＝以手指中心为焦点缩放画面，并随双指平移（焦点始终固定在手指下，不会乱跑）。
+  // 软键盘避让（基于代码机制 + 截图数据，已纠正此前错误理论）。
+  // 真正的区别（读代码确认）：fit 与 zoom 的「平移」实现不同。
+  //   fit  ：zoom<=1，canvas 正好塞进 .view，view.scrollTop=0，无内部滚动；键盘弹起 resizes-content 把布局
+  //          视口缩到键盘上方，#app 随 height:100% 缩到 361，整块画面自然落在键盘之上 → 天然生效。
+  //   zoom  ：setZoom 用 .view.scrollLeft/Top 平移（非 canvas transform），canvas 比 .view 大、被内部滚动。
+  //          键盘弹起时 resizes-content 收缩布局视口，浏览器 scroll-anchoring 把「已滚到底」的内容钉在视口
+  //          底部 = 正好顶在键盘上 → 用户看到「放大后画面被键盘盖住/贴在键盘边」。
+  // 解：zoom 态用 CSS transform 把 #app 整块顶到键盘上方（只动渲染位置，不改 .view 内部滚动 → 视角不变）；
+  //   #app 保持全高(fullH)再 translateY(−kbH)，露出完整键盘上方区域（工具条+画布都在）。fit 态 resizes-content 已天然生效，不干预。
+  // 注意：截图铁证 visualViewport.scrollTop 始终 NaN、window.scrollY 始终 0，绝不能用页面级滚动。
+  var app = document.getElementById('app');
+  var fullH = window.innerHeight;          // 键盘收起时全高，用于算真·键盘高（ih 与 vh 弹起后恒等，不能用 ih−vh）
+  var kbLifted = false;
+  var kbDismissT = null;   // 系统「收起键盘」的延迟确认（见 syncKb 收起分支）
+  // 两个跨周期记忆值（持久化到 localStorage，硬刷新/重开仍有效）：
+  //   kbK       ：键盘本体高（候选栏未现时），= 键盘周期内见到的最小遮挡（候选栏只增不减）
+  //   kbMaxEver ：键盘+候选栏的历史最大遮挡（候选栏出现时会变大）
+  // 上移量 = max(当前遮挡, kbMaxEver)；两者都还没学过时，用「键盘高 + 候选栏估计」预抬，避免首轮打字二次上移。
+  // 关键：候选栏高度无法在它出现前得知，故首轮用估计值预抬；真正出现后学会 kbMaxEver，之后每次开键盘直接预抬到含候选栏 → 打字零位移。
+  var kbK = 0, kbMaxEver = 0;
+  function loadKb() {
+    try {
+      var a = parseInt(localStorage.getItem('remote_kbK') || '0', 10); if (a > 0) kbK = a;
+      var b = parseInt(localStorage.getItem('remote_kbMaxEver') || '0', 10); if (b > 0) kbMaxEver = b;
+    } catch (e) { try {                    // 同源 iframe 下 parent.localStorage 等同，作兜底
+      var pa = parseInt(window.parent.localStorage.getItem('remote_kbK') || '0', 10); if (pa > 0) kbK = pa;
+      var pb = parseInt(window.parent.localStorage.getItem('remote_kbMaxEver') || '0', 10); if (pb > 0) kbMaxEver = pb;
+    } catch (e2) {} }
+  }
+  function saveKb() { try {
+    localStorage.setItem('remote_kbK', String(kbK));
+    localStorage.setItem('remote_kbMaxEver', String(kbMaxEver));
+  } catch (e) { try {
+    window.parent.localStorage.setItem('remote_kbK', String(kbK));
+    window.parent.localStorage.setItem('remote_kbMaxEver', String(kbMaxEver));
+  } catch (e2) {} } }
+  loadKb();
+  var kbEvt = '';
+  function applyKbLift(kbH) {
+    if (fitMode) {
+      // fit：收缩 #app 到可视高即可，resizes-content 天然把整块落到键盘之上，不动位移、不动滚动
+      app.style.height = Math.max(1, fullH - kbH) + 'px';
+      app.style.marginTop = '';
+      app.style.transform = '';
+    } else {
+      // zoom：保持 #app 全高，用 marginTop 把整块顶到键盘上方（不用 transform——transform 在某些
+      //   webview 的合成层中可能被外层容器的 overflow/clip 截断或覆盖；marginTop 是布局属性，
+      //   必定影响 getBoundingClientRect，且不会被合成管线吞掉）。
+      // 不改 .view 内部滚动 → 用户当前视角完全保留。
+      app.style.height = fullH + 'px';
+      app.style.marginTop = kbH > 0 ? '-' + kbH + 'px' : '';
+      app.style.transform = '';
+    }
+  }
+  function applyKbDrop() { app.style.height = ''; app.style.marginTop = ''; app.style.transform = ''; kbLifted = false; }
+  // 仅依据可视视口高度判定键盘弹起/收起，不依赖 blur（收起键盘时焦点常残留，会导致窗口卡在上方不复位）。
+  function syncKb() {
+    var vv = window.visualViewport;
+    var visH = vv ? vv.height : window.innerHeight;
+    var kbH = fullH - visH;
+    if (kbH > 20) {                         // 键盘弹起
+      clearTimeout(kbDismissT);             // 键盘在台上：撤销待执行的失焦，避免打字中被误关
+      if (kbH > kbMaxEver) { kbMaxEver = kbH; saveKb(); }
+      if (kbK <= 0 || kbH < kbK) { kbK = kbK <= 0 ? kbH : Math.min(kbK, kbH); saveKb(); }  // 记录键盘本体高（取最小）
+      var est = Math.max(36, Math.min(120, Math.round((kbK || kbH) * 0.12)));
+      var lift = Math.max(kbH, kbMaxEver, (kbK || kbH) + est);   // 始终含「键盘高+候选栏估计」预抬量 → 单调不回落、打字零位移
+      applyKbLift(lift);
+      kbLifted = true;
+      kbEvt = 'up h=' + Math.round(kbH) + ' lift=' + Math.round(lift);
+    } else {                                // 键盘收起
+      if (kbLifted) {
+        applyKbDrop(); kbEvt = 'drop';
+        // 用户若点的是系统「收起键盘」，系统只隐藏输入法、#kb 仍 focused（不触发 blur）。
+        // 此时必须真正 blur：否则之后点屏幕，touchstart 的 preventDefault 挡掉了浏览器默认的
+        // 「点别处失焦」，输入法又会重新弹起。延迟确认收起态稳定后再 blur，避免误伤打字中的瞬时抖动。
+        clearTimeout(kbDismissT);
+        kbDismissT = setTimeout(function () {
+          if (document.activeElement !== kb) return;
+          var vv2 = window.visualViewport;
+          var visH2 = vv2 ? vv2.height : window.innerHeight;
+          if (fullH - visH2 <= 20) kb.blur();   // 仍是收起态 → 确认用户主动收起，彻底失焦
+        }, 250);
+      }
+    }
+  }
+  window.addEventListener('resize', function () {
+    var vv = window.visualViewport;
+    var visH = vv ? vv.height : window.innerHeight;
+    if (fullH - visH <= 20) fullH = Math.max(fullH, window.innerHeight);   // 仅键盘真正收起(可视高≈全高)时更新全高，避免输入法临时失焦误写小值
+    syncKb();
+  });
+  if (window.visualViewport) {
+    visualViewport.addEventListener('resize', syncKb);
+    visualViewport.addEventListener('scroll', syncKb);
+  }
+  kb.addEventListener('focus', syncKb);
+  kb.addEventListener('blur', syncKb);       // 不主动 drop，交由 visH 判定，避免焦点残留卡住窗口
+
+  // ---- 触摸端交互（手机，单模式）----
+  // 单指：轻点=左键(带波纹)；滑动=平移视角(滚动画布，不发任何远程鼠标事件)；长按不放(≥550ms 不动)=右键。
+  //       单指拖动只平移、绝不误触远程。双指：捏合(手指间距变)=缩放画面；同向滑动=远程滚轮（滚动）。
   // #screen / .view / canvas 都 touch-action:none，浏览器原生缩放手势禁用，全部由这里接管。
   var touch = null;        // 单指状态
   var pinch = null;        // 双指状态
-  var lpTimer = null;      // 长按（右键）定时器
+  var lpTimer = null;      // 右键（长按）定时器
+  var dragArmT = null;     // 拖拽「武装」定时器：按住满 DRAG_HOLD 后拖动=拖拽远端
   var suppressUp = false;  // 已发右键，touchend 不再补左键
   var touchActive = false; // 触摸进行中：屏蔽合成鼠标事件（见上方桌面鼠标处理）
+  var touchEndTimer = null; // touchend 后延迟复位 touchActive，避免合成鼠标事件穿透
+
+  var RIGHT_DELAY = 550;   // 单指长按**不动** → 右键
+  var DRAG_HOLD = 300;     // 按住满此时长即「武装」，此后的拖动 = **远程拖拽**（拖文件/选文本/拖窗口）；
+                           // 未满就拖动 = 平移本地视角。这是「拖动画布」与「拖动远端内容」的分界。
+                           // 取 300ms：短到不必久等，又长到不会把「想平移视角」误判成拖拽远端。
 
   function tdist(a, b) {
     var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
@@ -469,75 +923,168 @@
   }
   function tmid(a, b) { return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 }; }
 
+  // 滚轮：**累积**而不是节流丢弃。
+  // 旧实现在节流窗口内直接 return，把这段时间的滚动量凭空丢掉——慢速小幅滑动时
+  // 大量增量消失，表现「划了半天内容才动一点」，且滚多远与手指速度不成比例。
+  var WHEEL_MS = 30;         // 发送间隔（约 33 次/秒，与原来一致）
+  var WHEEL_GAIN = 2.5;      // 手指位移(换算成远端屏幕像素) → 滚轮单位
+  var lastWheel = 0, wheelAcc = { x: 0, y: 0 }, wheelTimer = null;
+
+  function queueWheel(dx, dy) {
+    wheelAcc.x += dx; wheelAcc.y += dy;
+    var wait = WHEEL_MS - (Date.now() - lastWheel);
+    if (wait <= 0) { flushWheel(); return; }
+    clearTimeout(wheelTimer);
+    wheelTimer = setTimeout(flushWheel, wait);
+  }
+  function flushWheel() {
+    clearTimeout(wheelTimer); wheelTimer = null;
+    lastWheel = Date.now();
+    var dx = Math.trunc(wheelAcc.x), dy = Math.trunc(wheelAcc.y);
+    wheelAcc.x -= dx; wheelAcc.y -= dy;      // 留不足 1 的余数，慢速滑动也能持续滚动
+    if (dx || dy) send({ type: 'wheel', dx: dx, dy: dy });
+  }
+
+  // 触摸与桌面共用的鼠标移动节流
+  function throttleMove(p) {
+    var now = Date.now();
+    if (now - lastMove < MOVE_MS) return;
+    lastMove = now;
+    send({ type: 'mouse_move', x: p.x, y: p.y });
+  }
+
   canvas.addEventListener('touchstart', function (e) {
     e.preventDefault();
+    clearTimeout(touchEndTimer);
     touchActive = true;
     if (e.touches.length >= 2) {                 // 进入双指：先收掉单指未完成的动作
       clearTimeout(lpTimer);
+      clearTimeout(dragArmT);
+      indHide();                                 // 双指手势不是点击，收起单指落点标记
       if (touch && touch.down && !suppressUp) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
       touch = null; suppressUp = false;
       var pa = e.touches[0], pb = e.touches[1];
-      var pr = canvas.getBoundingClientRect();
-      var pf0 = tmid(pa, pb);
+      var mid = tmid(pa, pb);
       pinch = {
         d0: tdist(pa, pb), z0: zoom,
-        // 手势开始时手指中心下的远端内容坐标（固定锚点），平移/缩放都围绕它
-        cx0: (pf0.x - pr.left) / zoom,
-        cy0: (pf0.y - pr.top) / zoom
+        m0: mid,                                  // 初始手指中心：判定手势用，且**始终**是缩放锚点
+        c0: mid,                                  // 上一帧手指中心：滚轮 delta 用（增量）
+        nc: mid,                                  // 上一帧手指中心：缩放+平移的目标位置用
+        cx0: null, cy0: null,                     // 锚点内容坐标（判定为缩放时按 m0 算一次）
+        zoomMode: null                            // null=未定；true=捏合(缩放+平移)；false=滚轮
       };
       return;
     }
     var t = e.touches[0];
     var p = toScreen(t.clientX, t.clientY);
     if (!p) return;
-    touch = { sx: t.clientX, sy: t.clientY, p: p, last: p, t: Date.now(), moved: false, down: false };
+    touch = { sx: t.clientX, sy: t.clientY, lcx: t.clientX, lcy: t.clientY, p: p, last: p,
+              pressT: Date.now(), moved: false, down: false, rightFired: false, pan: false,
+              armed: false, dragMode: null };   // dragMode: null=未定 | 'pan'=平移视角 | 'remote'=拖拽远端
     suppressUp = false;
-    send({ type: 'mouse_move', x: p.x, y: p.y });   // 立即把远端光标移到手指下，保证「跟手」
+    // 注意：单指落点**不**发 mouse_move 瞬移远端光标。否则滑动/平移手势起始的那一下
+    // 会把远端光标瞬移到手指处、松手后残留——表现为「鼠标跟着跑、停在我滑动的位置」。
+    // 真正点击(tap)时由 mouse_click 自带 mouse_move 定位即可；平移/滚轮手势全程不碰远端光标。
+    // 远端不瞬移，但**本地必须立刻给反馈**：否则用户按下时完全不知道自己点在了哪里。
+    indStart(t.clientX, t.clientY);
+    // 按住满 DRAG_HOLD 即「武装」：此后开始拖动 = 拖拽远端内容（左键按下并跟随）。
+    // 若此前就已移动，说明用户想平移视角，不再武装。
+    clearTimeout(dragArmT);
+    dragArmT = setTimeout(function () {
+      if (!touch || touch.moved || touch.down) return;
+      touch.armed = true;
+      indArm();                                  // 转橙：告知「现在拖动＝拖远端」
+    }, DRAG_HOLD);
     clearTimeout(lpTimer);
-    lpTimer = setTimeout(function () {           // 长按＝右键（不要先按左键）
-      if (touch && !touch.moved && !touch.down) {
-        send({ type: 'mouse_down', x: p.x, y: p.y, button: 'right' });
-        send({ type: 'mouse_up', x: p.x, y: p.y, button: 'right' });
-        suppressUp = true;
-      }
-    }, 480);
+    lpTimer = setTimeout(function () {           // 长时间长按＝右键
+      if (!touch || touch.moved || touch.down) return;
+      send({ type: 'mouse_down', x: touch.p.x, y: touch.p.y, button: 'right' });
+      send({ type: 'mouse_up', x: touch.p.x, y: touch.p.y, button: 'right' });
+      indRight();                                // 变绿：明确告知右键已触发
+      spawnClickFx(touch.sx, touch.sy);
+      touch.rightFired = true; suppressUp = true;
+    }, RIGHT_DELAY);
   }, { passive: false });
 
   canvas.addEventListener('touchmove', function (e) {
     e.preventDefault();
-    if (e.touches.length >= 2 && pinch) {        // 双指：以手指中心为焦点的缩放 + 平移
+    if (e.touches.length >= 2 && pinch) {        // 双指：捏合=缩放，同向滑动=滚轮
       var a = e.touches[0], b = e.touches[1];
-      var nz = Math.max(0.25, Math.min(4, pinch.z0 * tdist(a, b) / (pinch.d0 || 1)));
-      var fx = tmid(a, b).x, fy = tmid(a, b).y;
-      setZoom(nz, false);                          // 改尺寸；fitMode 关闭后不改变滚动
-      var L2 = canvas.getBoundingClientRect();    // 缩放后画布实时位置（margin 可能变化）
-      // 锚点 cx0/cy0 是手势开始时手指中心下的内容，让它始终停在手指中心：
-      // 既实现「捏合围绕手指放大」，又实现「双指平移时内容跟随手指」
-      view.scrollLeft = view.scrollLeft + L2.left - fx + pinch.cx0 * nz;
-      view.scrollTop = view.scrollTop + L2.top - fy + pinch.cy0 * nz;
+      var nd = tdist(a, b);
+      var nc = tmid(a, b);
+      var dd = Math.abs(nd - pinch.d0);          // 手指间距变化量（捏合强度）
+      var mt = Math.hypot(nc.x - pinch.m0.x, nc.y - pinch.m0.y);  // 手指中心位移量（平移强度）
+      if (pinch.zoomMode === null && (dd > 10 || mt > 10)) {
+        // 移动足够后判定手势类型：间距变化占优=捏合(缩放)；中心位移占优=平移(滚轮)
+        pinch.zoomMode = (dd >= mt);
+        // 判定为滚轮的瞬间：先把远端光标移到手指中点。
+        // 滚轮是在**光标位置**滚动的（agent 的 wheel 不移动光标），不先定位的话
+        // 滚的是光标停留处的内容，与手指看着的位置完全对不上。
+        if (pinch.zoomMode === false) {
+          var wp = toScreen(pinch.m0.x, pinch.m0.y);
+          if (wp) { send({ type: 'mouse_move', x: wp.x, y: wp.y }); lastMove = Date.now(); }
+        } else {
+          // 判定为缩放的瞬间：记下**双指初始中心** m0 下的内容点作为锚点。
+          // 用 m0 而非当前中心 nc，锚点才不会随手指漂移——之后手指怎么动，
+          // 画面都以这个固定的内容点为基准跟随，缩放与平移互不干扰。
+          var cr0 = canvas.getBoundingClientRect();
+          if (cr0.width > 0 && cr0.height > 0 && screenW) {
+            pinch.cx0 = (pinch.m0.x - cr0.left) / cr0.width * screenW;
+            pinch.cy0 = (pinch.m0.y - cr0.top) / cr0.height * screenH;
+          }
+        }
+      }
+      if (pinch.zoomMode === true) {             // 捏合：缩放**同时**平移视角
+        // 锚点 (cx0,cy0) 是手势开始时双指中心下的内容点，全程固定；
+        // 目标位置取**当前**双指中心 nc，于是画面跟着手指一起移动。
+        var nz = Math.max(0.1, Math.min(4, pinch.z0 * nd / (pinch.d0 || 1)));
+        if (pinch.cx0 != null &&
+            (Math.abs(nz - zoom) > 0.0005 ||
+             Math.abs(nc.x - pinch.nc.x) > 0.5 || Math.abs(nc.y - pinch.nc.y) > 0.5)) {
+          setZoomAt(nz, pinch.cx0, pinch.cy0, nc.x, nc.y);
+          pinch.nc = nc;
+        }
+      } else if (pinch.zoomMode === false) {     // 已判定为滚轮才滚；未定(null)时不动，
+        // 否则想捏合缩放时，起手 10px 内的位移会被当成滚轮发出去（误滚）。
+        // 与竖向一致的「抓取」手感：内容跟随手指方向，故横向取反（手指右移→内容右移）。
+        // 除以 zoom 换算成**远端屏幕像素**：灵敏度不再随缩放漂移。
+        queueWheel(-(nc.x - pinch.c0.x) / (zoom || 1) * WHEEL_GAIN,
+                   (nc.y - pinch.c0.y) / (zoom || 1) * WHEEL_GAIN);
+      }
+      pinch.c0 = nc;
       return;
     }
     if (touch && e.touches.length === 1) {
       var t = e.touches[0];
-      var p = toScreen(t.clientX, t.clientY);
-      if (!p) return;
-      touch.last = p;
       if (!touch.moved && (Math.abs(t.clientX - touch.sx) > 6 || Math.abs(t.clientY - touch.sy) > 6)) {
         touch.moved = true;
-        clearTimeout(lpTimer);
-        if (!suppressUp && !touch.down) {        // 开始拖动：先把光标移到起点，再按下左键
-          send({ type: 'mouse_move', x: touch.p.x, y: touch.p.y });
+        clearTimeout(lpTimer);                   // 一旦移动，右键定时器取消（移动＝拖拽/平移，不当作点击）
+        clearTimeout(dragArmT);
+        if (touch.armed) {
+          // 已武装 → 这次拖动是**拖拽远端内容**（拖文件 / 选文本 / 拖窗口）。
+          // 按下点用落点 touch.p（用户瞄准的位置），而非当前位置，保证按得准。
+          touch.dragMode = 'remote';
           send({ type: 'mouse_down', x: touch.p.x, y: touch.p.y, button: 'left' });
           touch.down = true;
+          indRemote();
+        } else {
+          // 未武装就移动 → 平移本地视角，绝不向远程发鼠标事件，避免误触
+          touch.dragMode = 'pan';
+          indDrag();                             // 灰色淡化：明确表示「这次不会点击远端」
         }
       }
-      if (touch.down) {
-        var now = Date.now();
-        if (now - lastMove >= MOVE_MS) {
-          lastMove = now;
-          send({ type: 'mouse_move', x: p.x, y: p.y });
-        }
+      if (touch.dragMode === 'remote') {
+        // 拖拽路径**不能节流丢弃**中间点：否则远端只能收到首尾两个点，
+        // 画曲线会被连成直线（拖选文本、拖窗口都会明显失真）。
+        var pd = toScreen(t.clientX, t.clientY);
+        if (pd) { send({ type: 'mouse_move', x: pd.x, y: pd.y }); touch.last = pd; }
+      } else {
+        // 平移本地视角（滚动画布）
+        view.scrollLeft -= (t.clientX - touch.lcx);
+        view.scrollTop  -= (t.clientY - touch.lcy);
       }
+      touch.lcx = t.clientX; touch.lcy = t.clientY;
+      indMove(t.clientX, t.clientY);             // 落点标记跟随手指（内容坐标，故画面同步移动时它不动）
     }
   }, { passive: false });
 
@@ -545,20 +1092,45 @@
     if (e) e.preventDefault();
     clearTimeout(lpTimer);
     if (touch) {
-      if (suppressUp) { /* 右键已处理，不再补左键 */ }
-      else if (touch.down) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
-      else if (!touch.moved) send({ type: 'mouse_click', x: touch.p.x, y: touch.p.y, button: 'left', clicks: 1 });
+      if (touch.down) {
+        // 远程拖拽结束：按下已在进入拖拽时发过，这里补抬起。
+        // 漏发会让远端鼠标**一直卡在按下状态**（表现为东西被粘住跟着跑）。
+        send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
+      } else if (!suppressUp && !touch.moved) {
+        // 只有「没移动过且没发过右键」才当作一次左键点击（波纹反馈）；
+        // 移动过＝平移，右键已发＝suppressUp，均不触发。
+        send({ type: 'mouse_click', x: touch.p.x, y: touch.p.y, button: 'left', clicks: 1 });
+        spawnClickFx(touch.sx, touch.sy);        // 波纹＝点击已确认发出的回执
+      }
       touch = null;
+      clearTimeout(dragArmT);
+      // 松手收起落点标记；右键已触发时多留 420ms，让用户看清绿色确认
+      indHide(suppressUp ? 420 : 0);
     }
-    if (e && e.touches.length <= 1) pinch = null;   // 双指松开到单指：结束缩放
-    if (e && e.touches.length === 0) touchActive = false;
+    if (e && e.touches.length <= 1) {
+      if (pinch && pinch.zoomMode === false) flushWheel();   // 手势结束：把残余滚动量发出去
+      pinch = null;                                          // 双指松开到单指：结束捏合/滚轮
+    }
+    if (e && e.touches.length === 0) {
+      // 部分 WebView 在 touchend 后约 300ms 仍补发合成 mousedown/up，
+      // 若此刻 touchActive 已为 false，这些合成事件会穿透桌面鼠标处理器→远端误触发点击。
+      // 延迟复位，确保合成事件期间仍被屏蔽。
+      clearTimeout(touchEndTimer);
+      touchEndTimer = setTimeout(function () { touchActive = false; }, 600);
+    }
   }
   canvas.addEventListener('touchend', endTouch, { passive: false });
   canvas.addEventListener('touchcancel', function () {
     clearTimeout(lpTimer);
+    clearTimeout(dragArmT);
     if (touch && touch.down && !suppressUp) send({ type: 'mouse_up', x: touch.last.x, y: touch.last.y, button: 'left' });
     touch = null; pinch = null; suppressUp = false; touchActive = false;
+    indHide();
   }, { passive: false });
+
+  // 底部手势提示
+  var tip = $('f-tip');
+  if (tip) tip.textContent = '单指：轻点=左键｜立即拖=平移视角｜按住变橙后拖=拖拽远端｜长按变绿=右键；双指：捏合=缩放（可同时拖移视角），同向滑动=滚轮';
 
   // ---------------------------------------------------------------- 档位 / 细项
   function fillAdv() {
@@ -582,15 +1154,15 @@
   $('a-fps').addEventListener('input', function () { $('v-fps').textContent = this.value; });
   $('a-q').addEventListener('input', function () { $('v-q').textContent = this.value; });
   $('a-scale').addEventListener('input', function () { $('v-scale').textContent = this.value + '%'; });
-  $('btn-apply').addEventListener('click', function () { readAdv(); startStream(); updateMeta(); });
+  $('btn-apply').addEventListener('click', function () { readAdv(); startStream(); updateMeta(); writePrefs(); });
   $('btn-reset').addEventListener('click', function () {
-    cfg = Object.assign({}, PRESETS[presetName] || PRESETS.balanced);
-    fillAdv(); startStream(); updateMeta();
+    cfg = Object.assign({}, PRESETS[presetName] || BASE_PRESETS[presetName] || BASE_PRESETS.balanced);
+    fillAdv(); startStream(); updateMeta(); writePrefs();
   });
   $('preset').addEventListener('change', function () {
     presetName = this.value;
-    cfg = Object.assign({}, PRESETS[presetName] || PRESETS.balanced);
-    fillAdv(); startStream(); updateMeta();
+    cfg = Object.assign({}, PRESETS[presetName] || BASE_PRESETS[presetName] || BASE_PRESETS.balanced);
+    fillAdv(); lastStreamKey = ''; startStream(); updateMeta(); writePrefs();   // 强制重建流，确保切档立刻生效
   });
 
   function updateMeta() {
@@ -602,6 +1174,7 @@
     if (cfg.gray) bits.push('灰度');
     if (cfg.still) bits.push('静止不推帧');
     bits.push('缩放 ' + Math.round(zoom * 100) + '%');
+    if (sentRoi) bits.push('区域 ' + sentRoi.w + '×' + sentRoi.h);   // 生效中的 ROI，便于核对省流量是否真的在工作
     if (stat.fps || stat.kbps) bits.push('实测 ' + stat.fps + 'fps · ' + stat.kbps + ' KB/s');
     $('f-meta').textContent = bits.join(' · ');
   }
@@ -670,22 +1243,34 @@
 
   var lastStreamKey = '';
   function poll() {
-    api('/status').then(function (r) { return r.json(); }).then(function (d) {
+    api('/status').then(function (r) {
+      // 401/403 必须显式抛错交给下面的 catch 弹「登录已过期」：
+      // 若像以前那样只判 d.success 后静默 return，界面就会一直停在「重连中」且毫无提示。
+      if (r.status === 401 || r.status === 403) {
+        var e = new Error('unauthorized'); e.unauthorized = true; throw e;
+      }
+      return r.json();
+    }).then(function (d) {
       if (!d || !d.success) return;
       autostart = !!d.autostart;
+      // 拿到扩展宿主直连端口后建立 WebSocket 输入通道（失败会自动降级 HTTP）
+      if (d.ws_port && d.ws_port !== wsPort) { wsPort = d.ws_port; wsRetry = 0; }
+      wsConnect();
       if (d.online && d.info && d.info.screen) {
         online = true;
         var sw = d.info.screen.w, sh = d.info.screen.h;
         var changed = (sw !== screenW || sh !== screenH);
         screenW = sw; screenH = sh;
         hideOverlay();
-        if (d.presets) PRESETS = d.presets;
+        if (d.presets) PRESETS = Object.assign({}, PRESETS, d.presets);   // 合并不整体替换，保留三档基准
         var key = [cfg.fps, cfg.q, cfg.scale, cfg.gray, cfg.still].join('|');
         // 只在「首次连上」「分辨率变了」「档位变了」时重建流——
         // 否则轮询会不停打断正在看的画面
         if (changed || key !== lastStreamKey) {
           lastStreamKey = key;
           applyZoom();
+          restoreView();      // 画布尺寸就绪后还原上次平移位置（避免刷新甩到左上角）
+          reportRoi();        // 立即上报一次，确保首帧就按 ROI 传（而不是先传整屏再切）
           startStream();
         }
         updateMeta();
@@ -695,11 +1280,23 @@
         agentGuide(d.error || '');
         setState('err', '代理未运行');
       }
-    }).catch(function () {
+    }).catch(function (err) {
       online = false;
       stopStream();
-      setState('err', '服务不可达');
-      showOverlay('无法连接', '请确认 Dbox 正在运行。稍后自动重试。', [], true);
+      if (err && err.unauthorized) {
+        // 认证失败必须明说：否则 /stream 会一直 401 并退避重试，界面只剩一个「重连中」，
+        // 用户完全无从判断是代理没起、服务没起、还是自己登录过期了。
+        setState('err', '登录已过期');
+        showOverlay('登录已过期',
+          '访问令牌有效期为 24 小时，已过期或已在别处登出。<br><br>'
+          + '请<b>回到 Dbox 主界面重新登录</b>后再刷新本页；若确认当前是登录状态，'
+          + '可点下方按钮重新向主界面索取令牌。',
+          [{ text: '重新获取令牌', onClick: function () { requestToken(); setTimeout(poll, 500); } }],
+          false);
+      } else {
+        setState('err', '服务不可达');
+        showOverlay('无法连接', '请确认 Dbox 正在运行。稍后自动重试。', [], true);
+      }
     }).then(function () {
       clearTimeout(pollTimer);
       pollTimer = setTimeout(poll, online ? 3000 : 1500);
@@ -736,12 +1333,11 @@
         }, 2500);
       });
   });
-  window.addEventListener('resize', function () { if (fitMode) applyZoom(); });
+  window.addEventListener('resize', function () { if (document.activeElement === kb) syncKb(); else if (fitMode) applyZoom(); });
   window.addEventListener('online', function () { $('btn-reconnect').click(); });
 
   fillAdv();
   poll();
-  setTimeout(function () { kb.focus({ preventScroll: true }); }, 300);
 })();
 </script>
 </body>
