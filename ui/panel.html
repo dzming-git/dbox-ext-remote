@@ -430,6 +430,7 @@
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var reader = resp.body.getReader();
       var buf = new Uint8Array(0);
+      var drawFail = 0;            // 连续解码失败计数：超阈值即重连强制关键帧（见下）
       while (!ctl.signal.aborted) {
         var r = await reader.read();
         if (r.done) throw new Error('流已结束');
@@ -437,15 +438,25 @@
         buf = concatU8(buf, r.value);
         var res = splitFrames(buf);
         buf = res.rest;
+        var had = res.frames.length > 0;
+        var ok = false;
         for (var i = 0; i < res.frames.length; i++) {
           if (await drawFrame(res.frames[i].data, res.frames[i].rect)) {
             retry = 0;
             setWarn('');
             setState('on', '已连接');
+            ok = true;
           }
         }
-        // 缓冲只留最后一个未完整帧，避免长时间运行后无限增长
-        if (buf.length > 4 * 1024 * 1024) buf = new Uint8Array(0);
+        // 空拍（画面静止无补丁）不算失败；有补丁但全部解码失败才累计，避免静态画面误触发重连。
+        if (had && !ok) drawFail++; else if (had) drawFail = 0;
+        // 解码连续失败或缓冲异常膨胀：说明某拍补丁丢失/被截断（弱网卡在下一个周期关帧前会
+        // 一直花屏）。直接重连——后端新流首拍强制关键帧，最快把画布重新对齐，不必干等。
+        if (drawFail > 8 || buf.length > 4 * 1024 * 1024) {
+          stopStream();
+          startStream();
+          return;
+        }
       }
     } catch (e) {
       if (ctl.signal.aborted) return;      // 主动停止（换档位 / 重连），不算断线

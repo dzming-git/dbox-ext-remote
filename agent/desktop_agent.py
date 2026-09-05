@@ -513,9 +513,12 @@ _SIG_W, _SIG_H = 64, 36
 # 光标独立编码，无需额外处理。关键帧强制原生分辨率，确保前端画布锁定为整屏虚拟分辨率、补丁坐标对齐。
 TILE = 32                      # 脏矩形检测块大小（像素）
 DIFF_THRESHOLD = 12            # 单像素灰度差超过此值即认为该块变化（0-255）
-KF_INTERVAL = 45               # 每隔多少拍发一次整帧关键帧（≈8fps 下约 5.6s）
+KF_INTERVAL = 45               # 兜底：最多多少拍发一次关键帧（防计数器逻辑异常时永不发关帧）
+KF_INTERVAL_SEC = 4.0          # 关键帧按「时间」而非「拍数」强制：低帧率下拍间隔长，
+                               # 若只按拍数计，关帧会十几秒才来一次，丢一拍补丁就花屏很久；
+                               # 改时间制后任何帧率都至多 4s 自校准一次，低帧率也不再明显。
 _last = {'data': None, 'hash': None, 'sig': None, 'key': None,
-         'img': None, 'rect': None, 'kf': 0}
+         'img': None, 'kf_img': None, 'rect': None, 'kf': 0, 'kf_ts': 0.0}
 
 
 def _signature(img):
@@ -662,16 +665,23 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, r
     # 差分模式：与上一帧比对，只发变化矩形（P 帧）+ 周期关键帧（I 帧）
     if delta:
         rk = tuple(rect) if rect else None
-        prev = _last.get('img')
+        # 差分基线 = 上一次关键帧的整张捕获图（见下方 need_kf 分支更新 _last['kf_img']）。
+        # 旧实现每拍把基线推进到上一拍，丢一拍补丁就永久错位，直到关键帧才纠正。
+        prev = _last.get('kf_img')
         same_region = (_last.get('rect') == rk)
         # kf_force：后端在一条新流的首拍强制关键帧，否则重连时屏幕静止会一直返回空帧、
         # 前端永远等不到首帧而卡在「正在连接」。
         need_kf = (kf_force or prev is None or not same_region
-                   or _last.get('kf', 0) >= KF_INTERVAL)
+                   or _last.get('kf', 0) >= KF_INTERVAL
+                   or (time.time() - _last.get('kf_ts', 0)) >= KF_INTERVAL_SEC
+                   # 分辨率/布局变化：旧基准图尺寸与新帧不一致，逐 tile 比对会越界/错位，
+                   # 必须立即重发关键帧重建画布，否则整段花屏直到下一个周期关帧。
+                   or (prev is not None and img.size != prev.size))
         if need_kf:
             # 关键帧强制原生分辨率，确保前端画布锁定整屏虚拟分辨率、补丁坐标对齐
             data = _encode_jpeg(img, 1.0, quality, gray)
-            _last.update({'img': img, 'rect': rk, 'kf': 0})
+            _last.update({'kf_img': img, 'img': img, 'rect': rk, 'kf': 0,
+                          'kf_ts': time.time()})
             return ('kf', data, rk)                 # 整帧关键帧；前端按 rk 贴（None=整屏）
         rects = _diff_dirty_rects(img, prev, th, TILE)
         if not rects:
@@ -679,7 +689,9 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, r
             return ('empty',)                       # 完全没变：后端据此整拍跳过，零流量
         parts = []
         ox, oy = (rect[0], rect[1]) if rect else (0, 0)   # ROI 局部坐标 → 虚拟屏绝对坐标
-        sc = max(0.2, min(1.0, scale))
+        # 补丁必须与关键帧同分辨率（关键帧强制原生）：前端画布是原生尺寸，补丁降采样会被
+        # 浏览器拉伸糊掉且与坐标不对齐。delta 的省流量来自「只传变化区」而非降采样。
+        sc = 1.0
         for (lx, ly, lw, lh) in rects:
             crop = img.crop((lx, ly, lx + lw, ly + lh))
             if sc < 0.999:
@@ -689,7 +701,8 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, r
             buf = io.BytesIO()
             crop.save(buf, 'JPEG', quality=int(quality), optimize=False)
             parts.append((buf.getvalue(), (ox + lx, oy + ly, lw, lh)))
-        _last.update({'img': img, 'rect': rk, 'kf': _last.get('kf', 0) + 1})
+        # 只推进关键帧计数器；基线 kf_img 不动，补丁始终相对关键帧，保证丢帧可自愈
+        _last['kf'] = _last.get('kf', 0) + 1
         return ('patch', parts)
     # ---- 传统整帧模式（兼容 / 调试用）----
     sig = _signature(img)
