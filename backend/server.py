@@ -48,6 +48,9 @@ _last_input_ts = 0.0
 # 各用户「当前正在看的屏幕区域」（ROI，虚拟屏坐标），由前端 POST /viewport 上报。
 # 单独开接口而不是塞进 /stream 参数：平移/缩放是连续的，不可能每次变化都重启流。
 _viewports = {}
+# 各用户运行时画质配置（分辨率/质量/fps/灰度/静止/光标），由前端 POST /cfg 热更新；
+# /stream 生成器逐拍读取，改这些参数不再需要重建流。
+_stream_cfg = {}
 
 
 # ---------------------------------------------------------------- 输入 WebSocket 服务
@@ -213,6 +216,14 @@ def _touch_input():
     _last_input_ts = time.time()
 
 
+def _clamp(v, lo, hi, default, cast=float):
+    """通用区间裁剪：越界或不可转换时退回 default（与 _num 同语义，但参数直传）。"""
+    try:
+        return max(lo, min(hi, cast(v)))
+    except Exception:
+        return default
+
+
 def _parse_agent_rect(v):
     """解析代理回的 X-Frame-Rect: x,y,w,h；缺失或非法返回 None（表示整帧）。"""
     try:
@@ -330,45 +341,38 @@ def create_blueprint(host):
         uid = getattr(g, 'user_id', None)
         preset = _preset(request.args.get('preset'))
 
-        def _num(name, default, lo, hi, cast):
-            v = request.args.get(name)
-            if v is None or str(v).strip() == '':
-                return default
-            try:
-                return max(lo, min(hi, cast(v)))
-            except Exception:
-                return default
-
-        fps = _num('fps', preset['fps'], 1, 30, float)
-        quality = _num('q', preset['quality'], 10, 95, int)
-        scale = _num('scale', preset['scale'], 0.3, 1.0, float)
-        gray = (str(request.args.get('gray',
-                    '1' if preset['gray'] else '0')).lower() in ('1', 'true', 'yes'))
-        cursor = (str(request.args.get('cursor', '1')).lower() in ('1', 'true', 'yes'))
-        skip_still = (str(request.args.get('still',
-                          '1' if preset['skip_still'] else '0')).lower()
-                      in ('1', 'true', 'yes'))
-        interval = 1.0 / max(0.5, fps)
-
         def gen():
             miss = 0
             first = True
+            last_sig = None
             try:
                 while True:
+                    # 参数热更新：逐拍从 per-uid 运行时配置读取，改变分辨率/质量等不再
+                    # 需要重建流。分辨率(scale)或 ROI 变化会重建前端画布坐标系，必须下一
+                    # 拍强制关键帧，否则差分补丁会贴到旧尺寸画布上 → 黑框/错位。
+                    live = _stream_cfg.get(uid) or {}
+                    fps = _clamp(live.get('fps', preset['fps']), 1, 30, preset['fps'], float)
+                    quality = _clamp(live.get('q', preset['quality']), 10, 95, preset['quality'], int)
+                    scale = _clamp(live.get('scale', preset['scale']), 0.3, 1.0, preset['scale'], float)
+                    gray = bool(live.get('gray', preset['gray']))
+                    cursor = bool(live.get('cursor', True))
+                    skip_still = bool(live.get('still', preset['skip_still']))
+                    interval = 1.0 / max(0.5, fps)
                     # 活跃窗口内：强制推帧（still_thr=0），保证画图/拖拽实时可见
                     active = (time.time() - _last_input_ts) < ACTIVE_WINDOW
                     rect = _viewports.get(uid)          # 用户当前视口（ROI），可能为 None
                     # ROI 模式强制原生分辨率：区域本来就小，再降采样只会白白变糊
                     agent_scale = 1.0 if rect else scale
+                    sig = (round(agent_scale, 3), rect)  # 影响画布坐标系的参数签名
                     parts = ['scale=%.3f' % agent_scale, 'q=%d' % quality,
                              'gray=%s' % ('1' if gray else '0'),
                              'cursor=%s' % ('1' if cursor else '0'),
                              'delta=1']
-                    if first:
-                        # 新流首拍强制关键帧：否则重连时若屏幕静止，首拍会判空而整拍跳过，
-                        # 前端永远等不到首帧、卡在「正在连接」。收过首帧后即恢复差分。
+                    if first or sig != last_sig:
+                        # 首拍、或分辨率/ROI 变化：强制关键帧重建画布坐标系，杜绝黑框
                         parts.append('kf=1')
                         first = False
+                    last_sig = sig
                     if active:
                         parts.append('still_thr=0')
                     if rect:
@@ -461,6 +465,38 @@ def create_blueprint(host):
         else:
             _viewports[uid] = rect
         return jsonify({'success': True, 'roi': list(rect) if rect else None})
+
+    @bp.route('/cfg', methods=['POST'])
+    @host.login_required
+    def cfg_ep():
+        """前端实时调整画质参数（分辨率/质量/fps/灰度/静止/光标），热更新、不重建流。
+        分辨率(scale)或 ROI 变化由 /stream 生成器检测后强制关键帧，避免断流黑框。
+        """
+        payload = request.get_json(force=True, silent=True) or {}
+        uid = getattr(g, 'user_id', None)
+        cur = dict(_stream_cfg.get(uid) or {})
+        B = PRESETS['balanced']
+        if 'fps' in payload:
+            cur['fps'] = _clamp(payload.get('fps'), 1, 30, B['fps'], float)
+        if 'q' in payload:
+            cur['q'] = _clamp(payload.get('q'), 10, 95, B['quality'], int)
+        if 'scale' in payload:
+            # 前端传百分比(30-100)，内部存 0.3-1.0，与 /stream 的 scale 口径一致
+            cur['scale'] = _clamp(payload.get('scale'), 30, 100, 100, float) / 100.0
+        if 'gray' in payload:
+            cur['gray'] = bool(payload.get('gray'))
+        if 'cursor' in payload:
+            cur['cursor'] = bool(payload.get('cursor'))
+        if 'still' in payload:
+            cur['still'] = bool(payload.get('still'))
+        if 'delta' in payload:
+            cur['delta'] = bool(payload.get('delta'))
+        _stream_cfg[uid] = cur
+        return jsonify({'success': True, 'cfg': {
+            'scale': round(cur.get('scale', 1.0) * 100),
+            'q': cur.get('q'), 'fps': cur.get('fps'),
+            'gray': cur.get('gray'), 'cursor': cur.get('cursor'),
+            'still': cur.get('still'), 'delta': cur.get('delta')}})
 
     @bp.route('/agent/install', methods=['POST'])
     @host.login_required
