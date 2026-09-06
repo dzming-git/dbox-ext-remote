@@ -492,10 +492,33 @@ class AgentState(object):
         self.started_at = time.time()
 
     def session_id(self):
+        """真实会话号（原来这里返回的是 pid，语义是错的）。
+
+        会话守护靠它判断 agent 是否跑在「正显示画面的那个会话」里——返回 pid 的话
+        守护永远比不出来，只会无谓地反复重投。
+        """
         try:
-            return os.getpid()
+            import win32ts
+            return win32ts.ProcessIdToSessionId(os.getpid())
         except Exception:
             return 0
+
+    def env(self):
+        """会话 / 窗口站 / 桌面 / 完整性级别：守护据此决定要不要迁移 agent。
+
+        桌面名最关键：锁屏与登录界面时画面在 WinSta0\\Winlogon，登录后切到
+        WinSta0\\Default。agent 若留在旧桌面上，就是「连得上、但画面黑/不动」。
+        """
+        try:
+            w = winstation_info() or {}
+        except Exception:
+            w = {}
+        return {
+            'session': self.session_id(),
+            'winsta': w.get('winsta'),
+            'desktop': w.get('desktop'),
+            'integrity': integrity_level(),
+        }
 
 
 _STATE = None
@@ -619,9 +642,11 @@ def integrity_level():
         import win32security
         tok = win32security.OpenProcessToken(win32api.GetCurrentProcess(),
                                              win32security.TOKEN_QUERY)
-        # 24 = TokenIntegrityLevel。pywin32 返回的是 PyTOKEN_MANDATORY_LABEL，
-        # 真正要的 SID 在 .Label.Sid（不同版本偶有差异，逐级回退取）
-        info = win32security.GetTokenInformation(tok, 24)
+        # 25 = TokenIntegrityLevel（**不是 24**：24 是 TokenVirtualizationEnabled，
+        # 取回来是个 DWORD，喂给 ConvertSidToStringSid 就会报 "not a PySID object"，
+        # 于是这个字段一直显示 err，白白丢掉排查 UIPI 最关键的线索）。
+        # pywin32 返回 PyTOKEN_MANDATORY_LABEL，真正要的 SID 在 .Label.Sid。
+        info = win32security.GetTokenInformation(tok, 25)
         lab = getattr(info, 'Label', info)
         sid = getattr(lab, 'Sid', lab)
         if isinstance(sid, (tuple, list)):
@@ -704,16 +729,20 @@ def encode_frame(scale, quality, gray, still_thr=STILL_THRESHOLD, cursor=True, r
         # 只推进关键帧计数器；基线 kf_img 不动，补丁始终相对关键帧，保证丢帧可自愈
         _last['kf'] = _last.get('kf', 0) + 1
         return ('patch', parts)
-    # ---- 传统整帧模式（兼容 / 调试用）----
+    # ---- 传统整帧模式（面板关掉「差分传输」开关时走这里）----
+    # 必须返回**带标记**的元组：do_GET 靠 res[0] == 'kf'/'empty'/'single' 分流。
+    # 原先这里返回裸的 (data, hash, rect)，res[0] 是 JPEG 字节，三个分支一个都不匹配，
+    # 于是掉进 multipart 分支把 hash 字符串当补丁列表拆 → 抛异常 → 连接被掐断。
+    # 后果是「关掉差分传输后整屏变黑/无帧」（后端默认 delta=1，所以平时看不出来）。
     sig = _signature(img)
     rk = tuple(rect) if rect else None
     key = (round(scale, 3), int(quality), bool(gray), bool(cursor), rk)
     if _last['data'] is not None and _last['key'] == key and _is_still(sig, still_thr):
-        return _last['data'], _last['hash'], rk
+        return ('single', _last['data'], _last['hash'], rk)
     data = _encode_jpeg(img, scale, quality, gray)
     h = hashlib.md5(data).hexdigest()
     _last.update({'data': data, 'hash': h, 'sig': sig, 'key': key})
-    return data, h, rk
+    return ('single', data, h, rk)
 
 
 def _encode_jpeg(img, scale, quality, gray):
@@ -782,14 +811,19 @@ class Handler(BaseHTTPRequestHandler):
             qs = {k: v[0] for k, v in parse_qs(self.path.split('?', 1)[1]).items()}
         if path == '/info':
             s = _STATE.screen
-            self._json({
+            info = {
                 'ok': True,
                 'screen': {'w': s.width, 'h': s.height, 'left': s.left, 'top': s.top},
                 'pid': os.getpid(),
                 'session_id': _STATE.session_id(),
                 'started_at': _STATE.started_at,
                 'uptime': round(time.time() - _STATE.started_at, 1),
-            })
+            }
+            try:
+                info.update(_STATE.env())     # session / winsta / desktop / integrity
+            except Exception:
+                pass
+            self._json(info)
             return
         if path == '/cursor':
             try:

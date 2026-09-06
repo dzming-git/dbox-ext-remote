@@ -25,8 +25,10 @@ from flask import Blueprint, request, jsonify, Response, g
 
 try:
     from . import autostart
+    from . import sessiond
 except Exception:                       # 兼容按文件路径直接加载的情形
     import autostart
+    import sessiond
 
 AGENT_HOST = '127.0.0.1'
 AGENT_PORT = 18921
@@ -286,6 +288,19 @@ def create_blueprint(host):
     bp = Blueprint('ext_remote', __name__)
     logger = host.logger
 
+    # 会话守护：本进程是 AUTO_START 的 LocalSystem 服务，开机即运行（远早于任何登录）。
+    # 守护常驻于此，盯住控制台会话并把 agent 投到「当前显示画面的桌面」上——
+    # 已登录→WinSta0\Default，登录/锁屏界面→WinSta0\Winlogon（安全桌面）。
+    # 于是：①用户不必再手动点「启动代理」；②重启后停在登录界面也连得上，不会把人锁在外面。
+    # 详见 sessiond.py 模块头。
+    try:
+        sessiond.start(getattr(host, 'data_dir', None), logger)
+    except Exception as e:
+        try:
+            logger.error('远程桌面：会话守护启动失败 %s', e)
+        except Exception:
+            pass
+
     def _stream_auth():
         """/stream 用 <img> 加载，带不了 Authorization 头，故支持 ?token=。"""
         token = (request.args.get('token') or '').strip()
@@ -328,6 +343,8 @@ def create_blueprint(host):
             'presets': PRESETS,
             'agent': {'host': AGENT_HOST, 'port': AGENT_PORT},
             'ws_port': wport,
+            # 会话守护状态：面板据此显示「正在准备桌面」而不是让用户去点按钮
+            'sessiond': sessiond.snapshot(),
         })
 
     @bp.route('/stream', methods=['GET'])
@@ -521,7 +538,27 @@ def create_blueprint(host):
     @bp.route('/agent/start', methods=['POST'])
     @host.login_required
     def agent_start():
-        ok, msg = autostart.start_now()
+        # 走守护：直接把 agent 投到「当前显示画面的桌面」，不再依赖计划任务
+        # （schtasks /run 的令牌不等价，是「画面出来、点不动」的老毛病）。
+        ok, msg = sessiond.kick()
+        if not ok:                       # 守护不可用（极端情况）才退回旧路径
+            ok2, msg2 = autostart.start_now()
+            if ok2:
+                return jsonify({'success': True, 'message': msg2})
         return jsonify({'success': ok, 'message': msg})
+
+    @bp.route('/agent/enable', methods=['POST'])
+    @host.login_required
+    def agent_enable():
+        on = bool((request.get_json(force=True, silent=True) or {}).get('on', True))
+        sessiond.set_enabled(on)
+        if on:
+            sessiond.kick()
+        else:
+            try:
+                autostart._kill_existing()
+            except Exception:
+                pass
+        return jsonify({'success': True, 'enabled': on})
 
     return bp

@@ -1276,36 +1276,29 @@
   }
   function hideOverlay() { ov.style.display = 'none'; }
 
-  function agentGuide(err) {
-    // 安装失败必须把服务端原因显示出来：计划任务创建涉及账户与权限，
-    // 失败原因五花八门，静默重试只会让人反复点同一个按钮而毫无反馈
-    function doInstall() {
-      showOverlay('正在安装…', '正在创建计划任务并启动代理…', [], true);
-      api('/agent/install', { method: 'POST' })
-        .then(function (r) { return r.json().catch(function () { return {}; }); })
-        .then(function (d) {
-          if (d && d.success) {
-            showOverlay('已安装', '正在等待代理就绪…', [], true);
-            setTimeout(poll, 1500);
-            return;
-          }
-          showOverlay('安装失败', esc((d && d.message) || '未知错误'),
-                      [{ text: '重试', onClick: doInstall }], false);
-        }).catch(function (e) {
-          showOverlay('安装失败', '请求失败：' + esc(String(e)),
-                      [{ text: '重试', onClick: doInstall }], false);
-        });
+  // 初始化不该由用户来做：服务端守护常驻在 AUTO_START 的 Dbox 服务里，开机即运行，
+  // 会自己把 agent 投到「当前正在显示的桌面」——已登录投 WinSta0\Default，
+  // 登录界面/锁屏投 WinSta0\Winlogon。所以面板这里只做两件事：告知「正在自动准备」，
+  // 以及万一迟迟起不来才给一个手动重试入口（并把服务端原因原样显示出来）。
+  var prepKicked = false, offlineSince = 0;
+  function autoPrepare(err, sd, waited) {
+    if (!prepKicked) {
+      prepKicked = true;
+      api('/agent/start', { method: 'POST' }).catch(function () {});
     }
-    var btns = [{
-      text: autostart ? '立即启动代理' : '安装开机自启并启动',
-      onClick: doInstall,
-    }];
-    showOverlay('桌面代理未运行',
-      '画面采集与鼠标键盘注入必须由运行在<b>登录会话</b>里的代理进程完成——'
-      + 'Dbox 服务本身被 Windows 隔离在没有桌面的 Session 0，抓不到任何画面。<br><br>'
-      + '点击下方按钮把它设为「登录时自动启动」（Windows 计划任务），之后每次开机都会自动就绪。'
-      + (err ? '<br><span style="color:#6e7681">服务端返回：' + esc(err) + '</span>' : ''),
-      btns, false);
+    var detail = (sd && sd.last_err)
+      ? '<br><span style="color:#6e7681">服务端：' + esc(sd.last_err) + '</span>'
+      : (err ? '<br><span style="color:#6e7681">服务端返回：' + esc(err) + '</span>' : '');
+    if (waited < 15000) {
+      showOverlay('正在准备远程桌面…',
+        '正在自动启动桌面代理（随 Dbox 服务开机就绪，登录界面与锁屏同样可用），'
+        + '通常几秒内完成，无需任何操作。' + detail, [], true);
+      return;
+    }
+    showOverlay('桌面代理未能自动启动',
+      '已自动尝试启动但尚未成功。' + detail,
+      [{ text: '重试', onClick: function () { prepKicked = false; offlineSince = 0; poll(); } }],
+      false);
   }
 
   var lastStreamKey = '';
@@ -1325,6 +1318,7 @@
       wsConnect();
       if (d.online && d.info && d.info.screen) {
         online = true;
+        offlineSince = 0; prepKicked = false;      // 已就绪，重置「自动准备」状态
         var sw = d.info.screen.w, sh = d.info.screen.h;
         var changed = (sw !== screenW || sh !== screenH);
         screenW = sw; screenH = sh;
@@ -1344,8 +1338,9 @@
       } else {
         online = false;
         stopStream();
-        agentGuide(d.error || '');
-        setState('err', '代理未运行');
+        if (!offlineSince) offlineSince = Date.now();
+        autoPrepare(d.error || '', d.sessiond, Date.now() - offlineSince);
+        setState('err', '正在准备桌面');
       }
     }).catch(function (err) {
       online = false;
