@@ -313,12 +313,16 @@ def _dup_system_token_for_session(sess):
 
 def _user_token(sess):
     """兜底：该会话已登录用户的令牌（没人登录时不可用）。WTSQueryUserToken 返回的
-    已是主令牌，可直接使用，无需再复制。"""
+    已是主令牌，可直接使用，无需再复制。
+
+    **必须返回句柄对象本身，不能 _hval() 成 int 后丢掉对象**：PyHANDLE 析构时自动
+    CloseHandle，句柄会被立刻关掉，后续 CreateProcessAsUserW 报「句柄无效」(WinError 6)。
+    """
     try:
         import win32ts
-        return _hval(win32ts.WTSQueryUserToken(sess))
+        return win32ts.WTSQueryUserToken(sess)
     except Exception:
-        return 0
+        return None
 
 
 def _launch_with(token, desktop, cmd=None):
