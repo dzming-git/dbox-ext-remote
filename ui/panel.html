@@ -243,6 +243,10 @@
   var PRESETS = Object.assign({}, BASE_PRESETS);   // 可被服务端 d.presets 局部覆盖，但三档基准始终在
   var cfg = Object.assign({}, BASE_PRESETS.balanced);
   var presetName = 'balanced';
+  // 已存配置是否已推给后端。后端只认 POST /cfg 写入的运行时值，不主动推就一直按预设
+  // 默认值出流（表现为「设了灰度/帧率，刚打开却不生效，得开一次设置页才对」）；
+  // 后端重启后运行时配置会丢，所以断线重连要再推一次。
+  var cfgPushed = false;
   var screenW = 0, screenH = 0;      // 屏幕真实尺寸（用于坐标映射，取自 /status）
   var zoom = 1, fitMode = true;
 
@@ -268,6 +272,7 @@
         cfg.gray   = boolOr(o.cfg.gray, cfg.gray);
         cfg.still  = boolOr(o.cfg.still, cfg.still);
         cfg.cursor = boolOr(o.cfg.cursor, cfg.cursor);
+        cfg.delta  = boolOr(o.cfg.delta, cfg.delta);   // 差分开关此前漏读，每次重开都退回预设值
       }
       if (o && o.preset && BASE_PRESETS[o.preset]) presetName = o.preset;
       if (o && o.view) {
@@ -282,7 +287,9 @@
   }
   function writePrefs() {
     var o = {
-      cfg: { fps: cfg.fps, q: cfg.q, scale: cfg.scale, gray: cfg.gray, still: cfg.still, cursor: cfg.cursor },
+      // delta 此前漏存：用户关掉「差分传输」后一刷新又回到预设值，等于设置存不住
+      cfg: { fps: cfg.fps, q: cfg.q, scale: cfg.scale, gray: cfg.gray, still: cfg.still,
+             cursor: cfg.cursor, delta: cfg.delta },
       preset: presetName,
       view: { fit: fitMode, zoom: zoom, sl: view ? view.scrollLeft : 0, st: view ? view.scrollTop : 0 },
     };
@@ -1319,6 +1326,8 @@
       if (d.online && d.info && d.info.screen) {
         online = true;
         offlineSince = 0; prepKicked = false;      // 已就绪，重置「自动准备」状态
+        // 首帧之前把已存配置推给后端（否则头几帧仍是预设默认值）
+        if (!cfgPushed) { cfgPushed = true; pushCfg(); }
         var sw = d.info.screen.w, sh = d.info.screen.h;
         var changed = (sw !== screenW || sh !== screenH);
         screenW = sw; screenH = sh;
@@ -1337,6 +1346,7 @@
         updateMeta();
       } else {
         online = false;
+        cfgPushed = false;      // 下次连上重新推（后端重启会丢运行时配置）
         stopStream();
         if (!offlineSince) offlineSince = Date.now();
         autoPrepare(d.error || '', d.sessiond, Date.now() - offlineSince);
