@@ -865,29 +865,28 @@
   var fullH = (_initVV ? _initVV.height : window.innerHeight) || window.innerHeight;
   var kbLifted = false;
   var kbDismissT = null;   // 系统「收起键盘」的延迟确认（见 syncKb 收起分支）
-  // 两个跨周期记忆值（持久化到 localStorage，硬刷新/重开仍有效）：
-  //   kbK       ：键盘本体高（候选栏未现时），= 键盘周期内见到的最小遮挡（候选栏只增不减）
-  //   kbMaxEver ：键盘+候选栏的历史最大遮挡（候选栏出现时会变大）
-  // 上移量以实测 kbH 为主、kbMaxEver 仅作参考上限（不再无条件钉死）。
-  // 关键修复：kbMaxEver 不再单调递增——若连续多次实际 kbH 远小于它则自动衰减，
-  //   避免某次候选栏弹出记下大值后永久导致过度上移。
-  var kbK = 0, kbMaxEver = 0;
-  var _kbSmallCount = 0;   // 连续"kbH 明显小于 kbMaxEver"的次数，达到阈值后衰减 kbMaxEver
+  // 跨周期记忆值（持久化到 localStorage，硬刷新/重开仍有效）：
+  //   kbK：键盘本体高（候选栏未现时），= 见到的最小遮挡
+  // **只记这一个**。曾经还有个 kbMaxEver（历史最大遮挡，含候选栏），并拿它把上移量抬高
+  // 以防「候选栏出现时二次跳动」——但那会让上移量凭空多出几十像素（候选栏没出现时，这多
+  // 出来的一段就是底部黑条），而且它持久化在 localStorage，一旦被某次异常值写大，
+  // **刷新网页都无法恢复**（用户实测到的现象）。现改为上移量只取实测值：候选栏真出现时
+  // visH 会同步变小、kbH 随之变大，下一拍自然补齐，根本不需要预测。
+  var kbK = 0;
   function loadKb() {
     try {
       var a = parseInt(localStorage.getItem('remote_kbK') || '0', 10); if (a > 0) kbK = a;
-      var b = parseInt(localStorage.getItem('remote_kbMaxEver') || '0', 10); if (b > 0) kbMaxEver = b;
+      // 清掉旧版遗留的 kbMaxEver：它若已是被写大的异常值，会让过度上移一直复现
+      localStorage.removeItem('remote_kbMaxEver');
     } catch (e) { try {                    // 同源 iframe 下 parent.localStorage 等同，作兜底
       var pa = parseInt(window.parent.localStorage.getItem('remote_kbK') || '0', 10); if (pa > 0) kbK = pa;
-      var pb = parseInt(window.parent.localStorage.getItem('remote_kbMaxEver') || '0', 10); if (pb > 0) kbMaxEver = pb;
+      window.parent.localStorage.removeItem('remote_kbMaxEver');
     } catch (e2) {} }
   }
   function saveKb() { try {
     localStorage.setItem('remote_kbK', String(kbK));
-    localStorage.setItem('remote_kbMaxEver', String(kbMaxEver));
   } catch (e) { try {
     window.parent.localStorage.setItem('remote_kbK', String(kbK));
-    window.parent.localStorage.setItem('remote_kbMaxEver', String(kbMaxEver));
   } catch (e2) {} } }
   loadKb();
   var kbEvt = '';
@@ -915,27 +914,15 @@
     var kbH = fullH - visH;
     if (kbH > 20) {                         // 键盘弹起
       clearTimeout(kbDismissT);             // 键盘在台上：撤销待执行的失焦，避免打字中被误关
-      if (kbH > kbMaxEver) { kbMaxEver = kbH; _kbSmallCount = 0; saveKb(); }
-      // kbMaxEver 衰减：若实际 kbH 持续明显小于历史最大值（差 > 60px），说明之前的大值是
-      // 候选栏等临时因素造成的，不应永久钉死。连续 3 次后把 kbMaxEver 降到当前 kbH。
-      else if (kbMaxEver - kbH > 60) {
-        _kbSmallCount++;
-        if (_kbSmallCount >= 3) { kbMaxEver = kbH; _kbSmallCount = 0; saveKb(); }
-      } else {
-        _kbSmallCount = 0;
-      }
       if (kbK <= 0 || kbH < kbK) { kbK = kbK <= 0 ? kbH : Math.min(kbK, kbH); saveKb(); }  // 记录键盘本体高（取最小）
-      // lift 以实测 kbH 为主；kbMaxEver 只在"接近实测值"时才用作微调上限（防候选栏闪烁）；
-      // 不再无条件取 max(kbH, kbMaxEver, kbH+est)，避免历史大值或估计值导致过度上移。
-      var est = Math.max(36, Math.min(120, Math.round((kbK || kbH) * 0.12)));
-      var candidateLift = (kbK || kbH) + est;   // 首轮无历史数据时的保守估计
-      var lift = kbH;                            // 默认用实测值
-      if (kbMaxEver > 0 && kbMaxEver <= kbH + 80) {
-        // kbMaxEver 在合理范围内（比实测高不超过 80px），用它确保候选栏出现时不二次上移
-        lift = Math.max(lift, kbMaxEver);
-      } else if (!kbK && kbMaxEver === 0) {
-        // 从未学过任何值，用首轮估计避免首次打字时的二次跳动
-        lift = Math.max(lift, candidateLift);
+      // 上移量**只取实测遮挡 kbH**：抬得比实测多，键盘上方就多留一段空隙（底部露黑条），
+      // 且这段高度随历史峰值变化不定。候选栏真出现时 visH 会同步变小 → kbH 随之变大，
+      // 下一拍自然补齐，不需要靠历史峰值去「预测」。
+      var lift = kbH;
+      if (kbK <= 0) {
+        // 从未学过键盘高度（首次使用）：加一点保守余量，避免第一拍只抬一点又二次跳动；
+        // 学到 kbK 之后就完全按实测走。
+        lift = kbH + Math.max(36, Math.min(120, Math.round(kbH * 0.12)));
       }
       // 合理性硬上限：键盘不可能超过全高的 65%（任何设备的软键盘都不超过此比例）
       var maxLift = Math.round(fullH * 0.65);
@@ -962,7 +949,11 @@
   window.addEventListener('resize', function () {
     var vv = window.visualViewport;
     var visH = vv ? vv.height : window.innerHeight;
-    if (fullH - visH <= 20) fullH = Math.max(fullH, window.innerHeight);   // 仅键盘真正收起(可视高≈全高)时更新全高，避免输入法临时失焦误写小值
+    // 仅键盘真正收起（可视高≈全高）时更新全高，避免输入法临时失焦误写小值。
+    // **必须用 visH 而非 window.innerHeight**：手机浏览器的 innerHeight 含被工具栏遮挡的
+    // 部分，比 visualViewport.height 大；用它更新 fullH 会让随后算出的 kbH 凭空多出工具栏
+    // 高度 → 上移过头、底部露黑条，而 fullH 只增不减，一旦被写大就一直错下去。
+    if (fullH - visH <= 20) fullH = Math.max(fullH, visH);
     syncKb();
   });
   if (window.visualViewport) {
