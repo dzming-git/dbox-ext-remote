@@ -80,14 +80,61 @@ def interactive_user():
     return None
 
 
+_DATA_DIR = None
+
+
+def set_data_dir(d):
+    """由会话守护注入插件数据目录（用于存放「待办自启」标记）。"""
+    global _DATA_DIR
+    _DATA_DIR = d
+
+
+def _pending_path():
+    return os.path.join(_DATA_DIR, 'agent_autostart_pending') if _DATA_DIR else None
+
+
+def has_pending():
+    p = _pending_path()
+    try:
+        return bool(p and os.path.isfile(p))
+    except Exception:
+        return False
+
+
+def set_pending(on):
+    """登记/清除「等登录桌面后自动补建自启任务」。"""
+    p = _pending_path()
+    try:
+        if not p:
+            return False
+        if on:
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('1')
+        elif os.path.isfile(p):
+            os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
 def install():
-    """创建「登录时触发」的计划任务（已存在则覆盖）。"""
+    """创建「登录时触发」的计划任务（已存在则覆盖）。
+
+    没有已登录桌面时（典型：重启后停在登录界面）**不再报失败**——schtasks 的 /ru
+    需要一个具体账户，此刻确实建不了；但代理本来就由会话守护在登录后自动拉起，
+    用户并不需要手动安装。这里改为登记「待办」，由守护检测到桌面会话后自动补建，
+    界面只提示「已安排，登录后自动生效」，避免用户在登录界面反复点安装、反复失败。
+    """
     if not os.path.isfile(agent_script()):
         return False, '找不到 agent 脚本: %s' % agent_script()
     user = interactive_user()
     if not user:
-        return False, ('没有检测到已登录的桌面会话（explorer.exe 未运行），'
-                       '无法创建自启任务。请先登录到桌面再点安装。')
+        if set_pending(True):
+            return True, ('已安排：检测到桌面登录后会自动完成自启设置。'
+                          '在此之前代理由会话守护在登录后自动拉起，无需手动安装。')
+        return False, ('尚未检测到已登录的桌面会话（explorer.exe 未运行）。'
+                       '代理会由会话守护在你登录后自动拉起，无需手动安装；'
+                       '若仍要设置开机自启，请登录桌面后再点一次。')
     cmd = ['schtasks', '/create', '/tn', TASK_NAME, '/tr', _quoted_cmd(),
            '/sc', 'ONLOGON', '/ru', user, '/f']
     # **/rl HIGHEST 是必需的，不是可选项**。UIPI（用户界面特权隔离）会阻止低完整性
@@ -102,6 +149,7 @@ def install():
         rc, out = _run(cmd)
     if rc != 0:
         return False, (out or '').strip() or 'schtasks 创建失败'
+    set_pending(False)                    # 真正建成后清掉待办标记
     return True, '已设置为「%s」登录后自动启动（最高权限）' % user
 
 

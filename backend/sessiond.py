@@ -38,8 +38,14 @@ DESK_WINLOGON = 'WinSta0\\Winlogon'
 _NO_SESSION = 0xFFFFFFFF
 
 TICK = 5.0                 # 常态巡检间隔
-RELAUNCH_GRACE = 3.0       # 刚拉起后给 agent 的就绪时间，期间不重复拉
+# 刚拉起后给 agent 的就绪时间。必须覆盖「pythonw 启动 + 导入 Pillow/pywin32 +
+# 绑定端口」的全过程，给短了会在它起来之前就判为失败并杀掉（见 _tick 注释）。
+RELAUNCH_GRACE = 10.0
 BACKOFF_MAX = 60.0         # 连续失败时的最大退避
+# 杀掉旧 agent 后等待端口释放的上限。agent 是「端口被占即退出」的单实例，
+# 端口没真正释放就拉新的，新进程必然 bind 失败退出（表现＝反复重启都失败）。
+PORT_FREE_TIMEOUT = 8.0
+PENDING_CHECK_EVERY = 30.0 # 待办自启任务的重试间隔
 
 _lock = threading.Lock()
 _state = {
@@ -52,6 +58,8 @@ _state = {
     'next_try': 0.0,
     'target': None,
     'kicks': 0,
+    'fail_streak': 0,      # 连续失败次数，用于真正的指数退避
+    'pending_checked': 0.0,
 }
 
 
@@ -174,6 +182,40 @@ def agent_info():
         return d if d.get('ok') else None
     except Exception:
         return None
+
+
+def _port_open(port=AGENT_PORT, timeout=0.5):
+    """agent 端口是否仍在监听（＝旧实例是否还占着）。"""
+    s = None
+    try:
+        import socket
+        s = socket.socket()
+        s.settimeout(timeout)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
+
+
+def _wait_port_free(timeout=PORT_FREE_TIMEOUT):
+    """等旧 agent 真正释放端口，返回是否已空闲。
+
+    这是「反复重启/安装都失败」的根因所在：taskkill 返回 ≠ 端口已释放，
+    旧实现只固定 sleep 0.4s 就拉起新进程，而 agent 启动时 bind 失败会**直接退出**
+    （desktop_agent.main：OSError → return 2）。于是每次重投都是
+    「杀掉 → 端口还没放 → 新的起来就死」，用户看到的便是永远重启不成功。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _port_open():
+            return True
+        time.sleep(0.25)
+    return not _port_open()
 
 
 def _in_right_place(info, target):
@@ -391,32 +433,69 @@ def _tick():
         return                                   # 还没到登录界面/无控制台会话
     info = agent_info()
     if _in_right_place(info, target):
+        _state['fail_streak'] = 0                # 位置正确，清掉退避
         return                                   # 已在正确的会话+桌面，别动它
     now = time.time()
     if now < _state['next_try']:
         return
-    if info and (now - _state['last_launch']) < RELAUNCH_GRACE:
-        return                                   # 刚拉起，等它就绪
+    # 刚拉起过 → 一律给它完整的就绪时间，**不看 info 是否已上报**。
+    # 旧写法 `if info and ...` 恰恰在 agent 尚未就绪（info 为 None）时跳过这段保护，
+    # 于是刚创建的进程下一轮就被杀掉，陷入「杀—起—杀」风暴：
+    # 表现就是「重启后要等很久才碰巧连上」，锁屏/解锁切换时尤其明显。
+    if (now - _state['last_launch']) < RELAUNCH_GRACE:
+        return
     # 位置不对（切了会话 / 锁屏 / 解锁 / 首次开机）→ 杀掉再投
     try:
         autostart._kill_existing()
     except Exception:
         pass
-    time.sleep(0.4)                              # 等端口释放
+    # 必须等端口真正释放，而不是固定 sleep：agent 是「端口被占即退出」的单实例
+    if not _wait_port_free():
+        _state['fail_streak'] += 1
+        _state['last_err'] = '旧 agent 未释放端口 %s' % AGENT_PORT
+        _state['next_try'] = time.time() + TICK
+        _log('投递中止：%s' % _state['last_err'])
+        return
     try:
         pid, how = launch(target[0], target[1])
     except Exception as e:
+        _state['fail_streak'] += 1
         _state['last_err'] = str(e)
+        # 真正的指数退避（旧表达式 (now-last_launch)*0 + TICK 恒等于 TICK，
+        # 等于完全没有退避，失败时会以 5s 间隔无脑重试，进一步加剧重启风暴）
         _state['next_try'] = time.time() + min(
-            BACKOFF_MAX, max(TICK, (time.time() - _state['last_launch']) * 0 + TICK))
-        _log('投递失败（%s@%s，%s）：%s' % (target[0], target[1], '?', e))
+            BACKOFF_MAX, TICK * (2 ** min(_state['fail_streak'] - 1, 4)))
+        _log('投递失败（session=%s desktop=%s）：%s' % (target[0], target[1], e))
         return
     _state['launches'] += 1
     _state['last_launch'] = time.time()
     _state['last_err'] = ''
+    _state['fail_streak'] = 0
     _state['next_try'] = time.time() + RELAUNCH_GRACE
     _log('已投递 pid=%s 到 session=%s desktop=%s（方式：%s）'
          % (pid, target[0], target[1], how))
+
+
+def _flush_pending_autostart():
+    """补建「待办」的登录自启任务。
+
+    场景：用户在登录界面点过「安装」，但当时还没有桌面会话（explorer.exe 未运行），
+    任务建不了。守护开机即运行、远早于登录，正好负责在用户真正登录到桌面后补上，
+    用户不必再记着回来点一次。
+    """
+    now = time.time()
+    if now - _state['pending_checked'] < PENDING_CHECK_EVERY:
+        return
+    _state['pending_checked'] = now
+    try:
+        if not autostart.has_pending():
+            return
+        if not autostart.interactive_user():
+            return                        # 还没登录到桌面，下轮再试
+        ok, msg = autostart.install()
+        _log('补建自启任务%s：%s' % ('成功' if ok else '失败', msg))
+    except Exception as e:
+        _log('补建自启任务异常：%s' % e)
 
 
 def _loop():
@@ -425,6 +504,7 @@ def _loop():
         try:
             if is_enabled():
                 _tick()
+                _flush_pending_autostart()
         except Exception as e:
             _state['last_err'] = str(e)
         time.sleep(TICK)
@@ -435,14 +515,17 @@ def kick():
     _state['next_try'] = 0.0
     _state['last_launch'] = 0.0
     _state['kicks'] += 1
+    target = desired_target()
+    if target is None:
+        return False, '当前没有可投递的控制台会话（机器可能还未到登录界面）'
     try:
         autostart._kill_existing()
     except Exception:
         pass
-    time.sleep(0.3)
-    target = desired_target()
-    if target is None:
-        return False, '当前没有可投递的控制台会话（机器可能还未到登录界面）'
+    # 同 _tick：等端口真正释放，否则新 agent 一起就因端口被占退出，
+    # 用户点「重启代理」看到的永远是失败。
+    if not _wait_port_free():
+        return False, '旧 agent 未退出，端口 %s 仍被占用' % AGENT_PORT
     try:
         pid, how = launch(target[0], target[1])
     except Exception as e:
@@ -463,6 +546,10 @@ def start(data_dir=None, logger=None):
         _state['data_dir'] = data_dir
         _state['logger'] = logger
         _state['running'] = True
+        try:
+            autostart.set_data_dir(data_dir)   # 供「待办自启」标记落盘
+        except Exception:
+            pass
     threading.Thread(target=_loop, daemon=True).start()
     _log('守护已启动（data_dir=%s）' % data_dir)
 
